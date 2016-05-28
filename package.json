@@ -1,0 +1,37 @@
+{
+  "name": "TCompute",
+  "version": "0.1.0",
+  "description": "Compute Plugin for three.js",
+  "main": "src/TCompute.js",
+  "directories": {
+    "src": "src",
+    "dist": "dist"
+  },
+  "dependencies": {
+    "glslify": "^5.0.2"
+  },
+  "devDependencies": {
+  },
+  "scripts": {
+	"build": "browserify ./src/TCompute.js --s TCompute > ./dist/TCompute.js",
+	"builddocs": "jsdoc ./src/TCompute.js -d docs",
+	"buildlocal": "build.bat"
+  },
+  "browserify": {
+    "transform": 	["glslify" ]
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/gnonio/t-compute.git"
+  },
+  "keywords": [
+    "gpu",
+    "compute"
+  ],
+  "author": "Pedro Soares <pedrodavid.ms@gmail.com>",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/gnonio/t-compute/issues"
+  },
+  "homepage": "https://github.com/gnonio/t-compute"
+}
