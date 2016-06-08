@@ -1,6 +1,6 @@
 {
   "name": "TCompute",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Compute Plugin for three.js",
   "main": "src/TCompute.js",
   "directories": {
@@ -18,7 +18,7 @@
 	"buildlocal": "build.bat"
   },
   "browserify": {
-    "transform": 	["glslify" ]
+    "transform": 	["brfs" ]
   },
   "repository": {
     "type": "git",

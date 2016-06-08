@@ -13,4 +13,3 @@ vec4 set_channel_value( int channel, float value ) {
 	}	
 	return vec4( 0.0, 0.0, 0.0, 0.0 );	// should not happen
 }
-#pragma glslify: export(set_channel_value)

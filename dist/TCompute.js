@@ -40,7 +40,7 @@ function TCompute( renderer ) {
 		state.resetGL = renderer.resetGLState
 	}
 	
-	if ( typeof gl === undefined )
+	if ( gl === undefined )
 		console.error( 'Unable to setup WebGL context.' )
 	
 	this.renderer = renderer
@@ -61,6 +61,9 @@ function TCompute( renderer ) {
 		this.float_support = true
 	}
 	
+	// Compute Pass
+	this.computePass = {}
+	
 	// Programs
 	this.setupPrograms()
 	
@@ -72,6 +75,8 @@ function TCompute( renderer ) {
 }
 
 TCompute.prototype.setupRenderer = function( renderer ) {
+	// must dispose of programs, buffers and framebuffer if reinitializing
+	
 	var gl = renderer.context
 	var state = renderer.state
 	state.resetGL = renderer.resetGLState
@@ -85,44 +90,39 @@ TCompute.prototype.setupRenderer = function( renderer ) {
 TCompute.prototype.setupPrograms = function() {
 	var gl = this.context
 	
-	// Shader list sources
+	// Shader common function sources
+	this.functions_src = {
+		get_indices:		"vec2 get_indices( float col_t, float cols, float row_t, float rows ) {\r\n\tfloat col_index = floor( col_t * cols );\r\n\tfloat row_index = floor( row_t * rows );\r\n\r\n\treturn vec2( col_index, row_index );\r\n}\r\n",
+		get_coords:			"vec2 get_coords( float index, float cols, float cols_hstep, float rows, float row_hstep ) {\r\n\tfloat col_index = mod( index + 0.1, cols );// +0.1 prevents rounding error in next set of ops\r\n\tfloat row_index = floor( (index + 0.1) / cols );\r\n\r\n\t//float index = row_index * cols + col_index;\r\n\r\n\treturn vec2( col_index / cols + cols_hstep, row_index / rows + row_hstep );\r\n}\r\n",
+		get_channel_value:	"float get_channel_value( sampler2D texture, int channel, vec2 xy ) {\r\n\tfloat value = 0.0;\r\n\tif ( channel == 0 ) {\r\n\t\tvalue = texture2D( texture, xy ).r;\r\n\t} else if ( channel == 1 ) {\r\n\t\tvalue = texture2D( texture, xy ).g;\r\n\t} else if ( channel == 2 ) {\r\n\t\tvalue = texture2D( texture, xy ).b;\r\n\t} else if ( channel == 3 ) {\r\n\t\tvalue = texture2D( texture, xy ).a;\r\n\t}\r\n\treturn value;\r\n}\r\n",
+		set_channel_value:	"vec4 set_channel_value( int channel, float value ) {\t\r\n\tif ( channel == 0 ) {\r\n\t\treturn vec4( value, 0.0, 0.0, 0.0 );\r\n\t}\r\n\tif ( channel == 1 ) {\r\n\t\treturn vec4( 0.0, value, 0.0, 0.0 );\r\n\t}\r\n\tif ( channel == 2 ) {\r\n\t\treturn vec4( 0.0, 0.0, value, 0.0 );\r\n\t}\r\n\tif ( channel == 3 ) {\r\n\t\treturn vec4( 0.0, 0.0, 0.0, value );\r\n\t}\t\r\n\treturn vec4( 0.0, 0.0, 0.0, 0.0 );\t// should not happen\r\n}\r\n",
+		mix_channel_value:	"vec4 mix_channel_value( vec4 rgba, int channel, float value ) {\t\r\n\tif ( channel == 0 ) {\r\n\t\trgba.r = value;\r\n\t}\r\n\tif ( channel == 1 ) {\r\n\t\trgba.g = value;\r\n\t}\r\n\tif ( channel == 2 ) {\r\n\t\trgba.b = value;\r\n\t}\r\n\tif ( channel == 3 ) {\r\n\t\trgba.a = value;\r\n\t}\r\n\treturn rgba;\r\n}\r\n"
+	}
+	
+	// Shader main function sources
+	this.main_src = {
+		render_unpacked:	"void main( void ) {\r\n\tgl_FragColor = texture2D( A, UVs );\r\n}\r\n",
+		render_packed:		"void main( void ) {\r\n\t// get the implied row and column from .t and .s of passed (output) texture coordinate.\r\n\tfloat col_t = UVs.s;\r\n\tfloat row_t = UVs.t;\r\n\r\n\t// get the implied row and column indices\r\n\tvec2 rowcol = get_indices( col_t, OUTshape.x, row_t, OUTshape.y );\r\n\r\n\t// unpacked index (columns are multiplied by 4 channels)\r\n\tfloat up_index = rowcol.y * OUTshape.x * 4.0 + rowcol.x * 4.0;\r\n\r\n\t// set a sequence of four indices\r\n\tvec4 seq_indices = vec4( up_index, up_index + 1.0, up_index + 2.0, up_index + 3.0 );\r\n\r\n\t// get the sequence of coordinates of unpacked texture\r\n\tvec2 up_s = get_coords( seq_indices.x, up_cols_padded, up_col_hstep, OUTshape.y, OUThalfp.y );\r\n\tvec2 up_t = get_coords( seq_indices.y, up_cols_padded, up_col_hstep, OUTshape.y, OUThalfp.y );\r\n\tvec2 up_p = get_coords( seq_indices.z, up_cols_padded, up_col_hstep, OUTshape.y, OUThalfp.y );\r\n\tvec2 up_q = get_coords( seq_indices.w, up_cols_padded, up_col_hstep, OUTshape.y, OUThalfp.y );\r\n\r\n\t// read four values from unpacked texture\r\n\tfloat r = get_channel_value( A, Achan, up_s );\r\n\tfloat g = get_channel_value( A, Achan, up_t );\r\n\tfloat b = get_channel_value( A, Achan, up_p );\r\n\tfloat a = get_channel_value( A, Achan, up_q );\r\n\r\n\tgl_FragColor = vec4( r, g, b, a );\r\n}\r\n",
+		read_packed:		"void main( void ) {\r\n\tgl_FragColor = texture2D( A, UVs );\r\n}\r\n",
+		read_packed_padded:	"void main( void ) {\r\n\t// get the implied row and column from .t and .s of passed (output) texture coordinate.\r\n\tfloat col_t = UVs.s;\r\n\tfloat row_t = UVs.t;\r\n\t\r\n\t// get the implied row and column indices\r\n\tvec2 rowcol = get_indices( col_t, OUTshape.x, row_t, OUTshape.y );\r\n\t\r\n\t// this pixel index as if unpacked (up_cols = cols * 4.0)\r\n\tfloat index = rowcol.y * up_cols + rowcol.x * 4.0;\r\n\t\r\n\t// expanded indices per channel\r\n\tfloat index_r = index + 0.1;\r\n\tfloat index_g = index + 1.1;\r\n\tfloat index_b = index + 2.1;\r\n\tfloat index_a = index + 3.1;\r\n\t\r\n\t// number of padded elements(pixels) up to this index\r\n\tfloat pads_r = floor( index_r / up_cols_padded );\r\n\tfloat pads_g = floor( index_g / up_cols_padded );\r\n\tfloat pads_b = floor( index_b / up_cols_padded );\r\n\tfloat pads_a = floor( index_a / up_cols_padded );\r\n\t\r\n\t// new index accounting padding\r\n\tfloat nindex_r = index_r + pads_r * pad;\r\n\tfloat nindex_g = index_g + pads_g * pad;\r\n\tfloat nindex_b = index_b + pads_b * pad;\r\n\tfloat nindex_a = index_a + pads_a * pad;\r\n\r\n\t// new channel based on new index ( these get shifted )\r\n\tfloat nchannel_r = floor( mod( nindex_r, 4.0 ) );\r\n\tfloat nchannel_g = floor( mod( nindex_g, 4.0 ) );\r\n\tfloat nchannel_b = floor( mod( nindex_b, 4.0 ) );\r\n\tfloat nchannel_a = floor( mod( nindex_a, 4.0 ) );\r\n\t\r\n\t// can be optimized, at most 2 pixels should be read\r\n\t// get the sequence of coordinates of texture as if unpacked\r\n\tvec2 up_s = get_coords( nindex_r, up_cols, up_col_hstep, OUTshape.y, OUThalfp.y );\r\n\tvec2 up_t = get_coords( nindex_g, up_cols, up_col_hstep, OUTshape.y, OUThalfp.y );\r\n\tvec2 up_p = get_coords( nindex_b, up_cols, up_col_hstep, OUTshape.y, OUThalfp.y );\r\n\tvec2 up_q = get_coords( nindex_a, up_cols, up_col_hstep, OUTshape.y, OUThalfp.y );\r\n\t\r\n\t// read four values from texture considering the new channels \r\n\tfloat r = get_channel_value( A, int(nchannel_r), up_s );\r\n\tfloat g = get_channel_value( A, int(nchannel_g), up_t );\r\n\tfloat b = get_channel_value( A, int(nchannel_b), up_p );\r\n\tfloat a = get_channel_value( A, int(nchannel_a), up_q );\r\n\t\r\n\tgl_FragColor = vec4( r, g, b, a );\r\n}\r\n",
+		duplicate:			"void main( void ) {\r\n\tfloat A_value = get_channel_value( A, Achan, UVs );\r\n\tgl_FragColor = set_channel_value( OUTchan, A_value );\r\n}\r\n",
+		duplicate_packed:	"void main( void ) {\t\r\n\tgl_FragColor = texture2D( A, UVs );\r\n}\r\n",
+		pack:				"void main( void ) {\r\n\t// get the implied row and column from .t and .s of passed (output) texture coordinate.\r\n\tfloat col_t = UVs.s;\r\n\tfloat row_t = UVs.t;\r\n\t\r\n\t// get the implied row and column indices\r\n\tvec2 rowcol = get_indices( col_t, OUTshape.x, row_t, OUTshape.y );\r\n\t\r\n\t// unpacked row and column index (columns are multiplied by 4 channels)\r\n\tfloat up_col = rowcol.x * 4.0;\r\n\tfloat up_row = rowcol.y / OUTshape.y + OUThalfp.y;\r\n\t\r\n\t// set a sequence of four indices\r\n\tvec4 seq_col_indices = vec4( up_col, up_col + 1.0, up_col + 2.0, up_col + 3.0 );\r\n\t\r\n\t// get the sequence of coordinates of unpacked texture\r\n\tvec2 up_s = vec2( seq_col_indices.x / up_cols + up_col_hstep, up_row );\r\n\tvec2 up_t = vec2( seq_col_indices.y / up_cols + up_col_hstep, up_row );\r\n\tvec2 up_p = vec2( seq_col_indices.z / up_cols + up_col_hstep, up_row );\r\n\tvec2 up_q = vec2( seq_col_indices.w / up_cols + up_col_hstep, up_row );\r\n\t\r\n\t// read four values from unpacked texture\r\n\tfloat r = get_channel_value( A, Achan, up_s );\r\n\tfloat g = get_channel_value( A, Achan, up_t );\r\n\tfloat b = get_channel_value( A, Achan, up_p );\r\n\tfloat a = get_channel_value( A, Achan, up_q );\r\n\r\n\tgl_FragColor = vec4( r, g, b, a );\r\n}\r\n",
+		unpack:				"void main( void ) {\r\n\t// get the implied row and column from .t and .s of passed (output) texture coordinate.\r\n\tfloat col_t = UVs.s;\r\n\tfloat row_t = UVs.t;\r\n\r\n\tvec2 rowcol = get_indices( col_t, OUTshape.x, row_t, OUTshape.y );\r\n\tfloat p_col_index = floor( rowcol.x / 4.0 );\t\r\n\tfloat p_index = floor( rowcol.y * p_cols + p_col_index ); //  + 0.1\r\n\r\n\tint Achan = int( mod( rowcol.x, 4.0 ) );\r\n\tvec2 packed_st = get_coords( p_index, p_cols, p_col_hstep, OUTshape.y, OUThalfp.y );\r\n\tfloat value = get_channel_value( A, Achan, packed_st );\r\n\r\n\tgl_FragColor = set_channel_value( OUTchan, value );\r\n}\r\n",
+		transpose:			"void main( void ) {\t\r\n\tfloat value = get_channel_value( A, Achan, vec2( UVs.y, UVs.x ) );\t\r\n\tgl_FragColor = set_channel_value( OUTchan, value );\r\n}"
+	}
+	
+	// Shader sources
 	this.shaders_src = {
-		pass_through:		"// Quad pass-through\r\nprecision highp float;\n#define GLSLIFY 1\n\nattribute vec3 position;\n\nattribute vec2 uv;\n\nvarying vec2   UVs;\n\nvoid main( void ) {\n\n\tgl_Position = vec4( position, 1.0 );\n\n\tUVs = uv;\n\n}\n\n",
-		
-		read_packed:		"// PACKED TO PACKED (UNPADDED)\r\nprecision highp float;\n#define GLSLIFY 1\n\nvarying vec2      UVs;\t\t// texture coords of row/column to calculate\r\nuniform sampler2D A;\t\t// texture with data from padded A\r\n\nvoid main(void) {\n\n\t\n\n\tgl_FragColor = texture2D( A, UVs );\n\n}",
-		read_packed_padded:	"// PACKED TO PACKED (PADDED)\r\nprecision highp float;\n#define GLSLIFY 1\n\nvarying vec2\t\tUVs;\t\t\t// texture coords of row/column to calculate\r\n\nuniform float\t\tcols;\t\t\t// number of columns\r\nuniform float\t\tcol_hstep;\t\t// half step in texture space\r\nuniform float\t\trows;\t\t\t// number of rows\r\nuniform float\t\trow_hstep;\t\t// half step in texture space\r\n\nuniform float\t\tup_cols;\t\t// number of unpacked columns\r\nuniform float\t\tup_col_hstep;\t// half step in texture space\r\n\nuniform float\t\tpad;\t\t\t// number of unpacked columns accounting padding\r\nuniform float\t\tup_cols_padded;\t// number of unpacked columns accounting padding\r\n\nuniform sampler2D\tA;\t\t\t\t// texture with data from padded A\r\n\nvec2 get_indices_1540259130( float col_t, float cols, float row_t, float rows ) {\t\n\n\tfloat col_index = floor(col_t * cols);\n\n\tfloat row_index = floor(row_t * rows);\n\n\t\n\n\treturn vec2(col_index, row_index);\n\n}\n\nvec2 get_coords_1117569599( float index, float cols, float cols_hstep, float rows, float row_hstep ) {\n\n\tfloat col_index = mod( index + 0.1, cols );// +0.1 prevents rounding error in next set of ops\r\n\tfloat row_index = floor( (index + 0.1) / cols );\n\n\t\n\n\t//float index = row_index * cols + col_index;\r\n\t\n\n\treturn vec2( col_index / cols + cols_hstep, row_index / rows + row_hstep );\n\n}\n\nfloat get_channel_value_1604150559( sampler2D texture, int channel, vec2 xy ) {\n\n\tfloat value = 0.0;\n\n\tif ( channel == 0 ) {\n\n\t\tvalue = texture2D( texture, xy ).r;\n\n\t} else if ( channel == 1 ) {\n\n\t\tvalue = texture2D( texture, xy ).g;\n\n\t} else if ( channel == 2 ) {\n\n\t\tvalue = texture2D( texture, xy ).b;\n\n\t} else if ( channel == 3 ) {\n\n\t\tvalue = texture2D( texture, xy ).a;\n\n\t}\t\n\n\treturn value;\n\n}\n\nvoid main(void) {\n\n\t// get the implied row and column from .t and .s of passed (output) texture coordinate.\r\n\tfloat col_t = UVs.s;\n\n\tfloat row_t = UVs.t;\n\n\t\n\n\t// get the implied row and column indices\r\n\tvec2 rowcol = get_indices_1540259130( col_t, cols, row_t, rows );\n\n\t\n\n\t// this pixel index as if unpacked (up_cols = cols * 4.0)\r\n\tfloat index = rowcol.y * up_cols + rowcol.x * 4.0;\n\n\t\n\n\t// expanded indices per channel\r\n\tfloat index_r = index + 0.1;\n\n\tfloat index_g = index + 1.1;\n\n\tfloat index_b = index + 2.1;\n\n\tfloat index_a = index + 3.1;\n\n\t\n\n\t// number of padded elements(pixels) up to this index\r\n\tfloat pads_r = floor( index_r / up_cols_padded );\n\n\tfloat pads_g = floor( index_g / up_cols_padded );\n\n\tfloat pads_b = floor( index_b / up_cols_padded );\n\n\tfloat pads_a = floor( index_a / up_cols_padded );\n\n\t\n\n\t// new index accounting padding\r\n\tfloat nindex_r = index_r + pads_r * pad;\n\n\tfloat nindex_g = index_g + pads_g * pad;\n\n\tfloat nindex_b = index_b + pads_b * pad;\n\n\tfloat nindex_a = index_a + pads_a * pad;\n\n\t// new channel based on new index ( these get shifted )\r\n\tfloat nchannel_r = floor( mod( nindex_r, 4.0 ) );\n\n\tfloat nchannel_g = floor( mod( nindex_g, 4.0 ) );\n\n\tfloat nchannel_b = floor( mod( nindex_b, 4.0 ) );\n\n\tfloat nchannel_a = floor( mod( nindex_a, 4.0 ) );\n\n\t\n\n\t// can be optimized, at most 2 pixels should be read\r\n\t// get the sequence of coordinates of texture as if unpacked\r\n\tvec2 up_s = get_coords_1117569599( nindex_r, up_cols, up_col_hstep, rows, row_hstep );\n\n\tvec2 up_t = get_coords_1117569599( nindex_g, up_cols, up_col_hstep, rows, row_hstep );\n\n\tvec2 up_p = get_coords_1117569599( nindex_b, up_cols, up_col_hstep, rows, row_hstep );\n\n\tvec2 up_q = get_coords_1117569599( nindex_a, up_cols, up_col_hstep, rows, row_hstep );\n\n\t\n\n\t// read four values from texture considering the new channels \r\n\tfloat r = get_channel_value_1604150559( A, int(nchannel_r), up_s );\n\n\tfloat g = get_channel_value_1604150559( A, int(nchannel_g), up_t );\n\n\tfloat b = get_channel_value_1604150559( A, int(nchannel_b), up_p );\n\n\tfloat a = get_channel_value_1604150559( A, int(nchannel_a), up_q );\n\n\t\n\n\tgl_FragColor = vec4( r, g, b, a );\n\n}",
-		pack:				"// UNPACKED to PACKED+UNDEFERRED\r\nprecision highp float;\n#define GLSLIFY 1\n\nvarying vec2      \tUVs;\t// texture coords of row/column to calculate\r\n\nuniform float\t\tcols;\t\t\t// number of columns\r\nuniform float\t\tcol_hstep;\t\t// half step in texture space\r\nuniform float\t\trows;\t\t\t// number of rows\r\nuniform float\t\trow_hstep;\t\t// half step in texture space\r\n\nuniform float\t\tup_cols;\t\t// number of unpacked columns\r\nuniform float\t\tup_col_hstep;\t// half step in texture\r\n\nuniform sampler2D\tA;\t\t\t\t// texture with unpacked data A\r\nuniform int\t\t\tA_channel;\t\t// channel to read data from\r\n\nvec2 get_indices_1540259130( float col_t, float cols, float row_t, float rows ) {\t\n\n\tfloat col_index = floor(col_t * cols);\n\n\tfloat row_index = floor(row_t * rows);\n\n\t\n\n\treturn vec2(col_index, row_index);\n\n}\n\nvec2 get_coords_1604150559( float index, float cols, float cols_hstep, float rows, float row_hstep ) {\n\n\tfloat col_index = mod( index + 0.1, cols );// +0.1 prevents rounding error in next set of ops\r\n\tfloat row_index = floor( (index + 0.1) / cols );\n\n\t\n\n\t//float index = row_index * cols + col_index;\r\n\t\n\n\treturn vec2( col_index / cols + cols_hstep, row_index / rows + row_hstep );\n\n}\n\nfloat get_channel_value_1117569599( sampler2D texture, int channel, vec2 xy ) {\n\n\tfloat value = 0.0;\n\n\tif ( channel == 0 ) {\n\n\t\tvalue = texture2D( texture, xy ).r;\n\n\t} else if ( channel == 1 ) {\n\n\t\tvalue = texture2D( texture, xy ).g;\n\n\t} else if ( channel == 2 ) {\n\n\t\tvalue = texture2D( texture, xy ).b;\n\n\t} else if ( channel == 3 ) {\n\n\t\tvalue = texture2D( texture, xy ).a;\n\n\t}\t\n\n\treturn value;\n\n}\n\nvoid main(void) {\n\n\t// get the implied row and column from .t and .s of passed (output) texture coordinate.\r\n\tfloat col_t = UVs.s;\n\n\tfloat row_t = UVs.t;\n\n\t\n\n\t// get the implied row and column indices\r\n\tvec2 rowcol = get_indices_1540259130( col_t, cols, row_t, rows );\n\n\t\n\n\t// unpacked row and column index (columns are multiplied by 4 channels)\r\n\tfloat up_col = rowcol.x * 4.0;\n\n\tfloat up_row = rowcol.y / rows + row_hstep;\n\n\t\n\n\t// set a sequence of four indices\r\n\tvec4 seq_col_indices = vec4( up_col, up_col + 1.0, up_col + 2.0, up_col + 3.0 );\n\n\t\n\n\t// get the sequence of coordinates of unpacked texture\r\n\tvec2 up_s = vec2( seq_col_indices.x / up_cols + up_col_hstep, up_row );\n\n\tvec2 up_t = vec2( seq_col_indices.y / up_cols + up_col_hstep, up_row );\n\n\tvec2 up_p = vec2( seq_col_indices.z / up_cols + up_col_hstep, up_row );\n\n\tvec2 up_q = vec2( seq_col_indices.w / up_cols + up_col_hstep, up_row );\n\n\t\n\n\t// read four values from unpacked texture\r\n\tfloat r = get_channel_value_1117569599( A, A_channel, up_s );\n\n\tfloat g = get_channel_value_1117569599( A, A_channel, up_t );\n\n\tfloat b = get_channel_value_1117569599( A, A_channel, up_p );\n\n\tfloat a = get_channel_value_1117569599( A, A_channel, up_q );\n\n\tgl_FragColor = vec4( r, g, b, a );\n\n}",
-		unpack:				"// PACKED+UNDEFERRED TO UNPACKED\r\nprecision highp float;\n#define GLSLIFY 1\n\nvarying vec2\t\tUVs;\t\t\t// texture coords of row/column to calculate\r\n\nuniform float\t\tcols;\t\t\t// number of columns\r\nuniform float\t\tcol_hstep;\t\t// half step in texture space\r\nuniform float\t\trows;\t\t\t// number of rows\r\nuniform float\t\trow_hstep;\t\t// half step in texture space\r\n\nuniform float\t\tp_cols;\t\t\t// number of packed columns\r\nuniform float\t\tp_col_hstep;\t// half step in texture space\r\n\nuniform sampler2D\tA;\t\t\t\t// texture with single channel data from A\r\n\nuniform int\t\t\twrite_channel;\t// channel to write texture to\r\n\nvec2 get_indices_1540259130( float col_t, float cols, float row_t, float rows ) {\t\n\n\tfloat col_index = floor(col_t * cols);\n\n\tfloat row_index = floor(row_t * rows);\n\n\t\n\n\treturn vec2(col_index, row_index);\n\n}\n\nvec2 get_coords_1604150559( float index, float cols, float cols_hstep, float rows, float row_hstep ) {\n\n\tfloat col_index = mod( index + 0.1, cols );// +0.1 prevents rounding error in next set of ops\r\n\tfloat row_index = floor( (index + 0.1) / cols );\n\n\t\n\n\t//float index = row_index * cols + col_index;\r\n\t\n\n\treturn vec2( col_index / cols + cols_hstep, row_index / rows + row_hstep );\n\n}\n\nfloat get_channel_value_1117569599( sampler2D texture, int channel, vec2 xy ) {\n\n\tfloat value = 0.0;\n\n\tif ( channel == 0 ) {\n\n\t\tvalue = texture2D( texture, xy ).r;\n\n\t} else if ( channel == 1 ) {\n\n\t\tvalue = texture2D( texture, xy ).g;\n\n\t} else if ( channel == 2 ) {\n\n\t\tvalue = texture2D( texture, xy ).b;\n\n\t} else if ( channel == 3 ) {\n\n\t\tvalue = texture2D( texture, xy ).a;\n\n\t}\t\n\n\treturn value;\n\n}\n\nvec4 set_channel_value_2281831123( int channel, float value ) {\t\n\n\tif ( channel == 0 ) {\n\n\t\treturn vec4( value, 0.0, 0.0, 0.0 );\n\n\t}\n\n\tif ( channel == 1 ) {\n\n\t\treturn vec4( 0.0, value, 0.0, 0.0 );\n\n\t}\n\n\tif ( channel == 2 ) {\n\n\t\treturn vec4( 0.0, 0.0, value, 0.0 );\n\n\t}\n\n\tif ( channel == 3 ) {\n\n\t\treturn vec4( 0.0, 0.0, 0.0, value );\n\n\t}\t\n\n\treturn vec4( 0.0, 0.0, 0.0, 0.0 );\t// should not happen\r\n}\n\nvoid main(void) {\n\n\t// get the implied row and column from .t and .s of passed (output) texture coordinate.\r\n\tfloat col_t = UVs.s;\n\n\tfloat row_t = UVs.t;\n\n\t\n\n\tvec2 rowcol = get_indices_1540259130( col_t, cols, row_t, rows );\n\n\tfloat p_col_index = floor( rowcol.x / 4.0 );\t\n\n\tfloat p_index = floor( rowcol.y * p_cols + p_col_index ); //  + 0.1\r\n\t\n\n\tint A_channel = int( mod( rowcol.x, 4.0 ) );\n\n\tvec2 packed_st = get_coords_1604150559( p_index, p_cols, p_col_hstep, rows, row_hstep );\t\n\n\tfloat value = get_channel_value_1117569599( A, A_channel, packed_st );\n\n\t\n\n\tgl_FragColor = set_channel_value_2281831123( write_channel, value );\n\n}\n\n",
-		render_packed:		"// UNPACKED to PACKED+DEFERRED\r\nprecision highp float;\n#define GLSLIFY 1\n\nvarying vec2\t\tUVs;\t\t\t// texture coords of row/column to calculate\r\n\nuniform float\t\tcols;\t\t\t// number of columns\r\nuniform float\t\tcol_hstep;\t\t// half step in texture space\r\nuniform float\t\trows;\t\t\t// number of rows\r\nuniform float\t\trow_hstep;\t\t// half step in texture space\r\n\nuniform float\t\tup_cols;\t\t// number of unpacked columns\r\nuniform float\t\tup_col_hstep;\t// half step in texture space\r\nuniform float\t\tup_cols_padded;\t// number of unpacked columns accounting padding\r\n\nuniform sampler2D\tA;\t\t\t\t// texture with single channel data\r\nuniform int\t\t\tA_channel;\t\t// channel to read data from\r\n\nvec2 get_indices_1540259130( float col_t, float cols, float row_t, float rows ) {\t\n\n\tfloat col_index = floor(col_t * cols);\n\n\tfloat row_index = floor(row_t * rows);\n\n\t\n\n\treturn vec2(col_index, row_index);\n\n}\n\nvec2 get_coords_1604150559( float index, float cols, float cols_hstep, float rows, float row_hstep ) {\n\n\tfloat col_index = mod( index + 0.1, cols );// +0.1 prevents rounding error in next set of ops\r\n\tfloat row_index = floor( (index + 0.1) / cols );\n\n\t\n\n\t//float index = row_index * cols + col_index;\r\n\t\n\n\treturn vec2( col_index / cols + cols_hstep, row_index / rows + row_hstep );\n\n}\n\nfloat get_channel_value_1117569599( sampler2D texture, int channel, vec2 xy ) {\n\n\tfloat value = 0.0;\n\n\tif ( channel == 0 ) {\n\n\t\tvalue = texture2D( texture, xy ).r;\n\n\t} else if ( channel == 1 ) {\n\n\t\tvalue = texture2D( texture, xy ).g;\n\n\t} else if ( channel == 2 ) {\n\n\t\tvalue = texture2D( texture, xy ).b;\n\n\t} else if ( channel == 3 ) {\n\n\t\tvalue = texture2D( texture, xy ).a;\n\n\t}\t\n\n\treturn value;\n\n}\n\nvoid main(void) {\n\n\t// get the implied row and column from .t and .s of passed (output) texture coordinate.\r\n\tfloat col_t = UVs.s;\n\n\tfloat row_t = UVs.t;\n\n\t\n\n\t// get the implied row and column indices\r\n\tvec2 rowcol = get_indices_1540259130( col_t, cols, row_t, rows );\n\n\t\n\n\t// unpacked index (columns are multiplied by 4 channels)\r\n\tfloat up_index = rowcol.y * cols * 4.0 + rowcol.x * 4.0;\n\n\t\n\n\t// set a sequence of four indices\r\n\tvec4 seq_indices = vec4( up_index, up_index + 1.0, up_index + 2.0, up_index + 3.0 );\n\n\t\n\n\t// get the sequence of coordinates of unpacked texture\r\n\tvec2 up_s = get_coords_1604150559( seq_indices.x, up_cols_padded, up_col_hstep, rows, row_hstep );\n\n\tvec2 up_t = get_coords_1604150559( seq_indices.y, up_cols_padded, up_col_hstep, rows, row_hstep );\n\n\tvec2 up_p = get_coords_1604150559( seq_indices.z, up_cols_padded, up_col_hstep, rows, row_hstep );\n\n\tvec2 up_q = get_coords_1604150559( seq_indices.w, up_cols_padded, up_col_hstep, rows, row_hstep );\n\n\t\n\n\t// read four values from unpacked texture\r\n\tfloat r = get_channel_value_1117569599( A, A_channel, up_s );\n\n\tfloat g = get_channel_value_1117569599( A, A_channel, up_t );\n\n\tfloat b = get_channel_value_1117569599( A, A_channel, up_p );\n\n\tfloat a = get_channel_value_1117569599( A, A_channel, up_q );\n\n\tgl_FragColor = vec4( r, g, b, a );\n\n}\n\n",
-		render_unpacked:	"// UNPACKED to UNPACKED\r\nprecision highp float;\n#define GLSLIFY 1\n\nvarying vec2      UVs;\t// texture coords of row/column to calculate\r\nuniform sampler2D A;\t\t// texture with data from padded A\r\n\nvoid main( void ) {\t\n\n\tgl_FragColor = texture2D( A, UVs );\n\n}",
-		
-		mixin:				"// UNPACKED\r\nprecision highp float;\n#define GLSLIFY 1\n\n// Uniforms\r\n\nvarying vec2\t\tUVs;\t\t\t// texture coords of row/column to calculate\r\n\n// uRED\r\n\n// uGREEN\r\n\n// uBLUE\r\n\n// uALPHA\r\n\nfloat get_channel_value_1540259130( sampler2D texture, int channel, vec2 xy ) {\n\n\tfloat value = 0.0;\n\n\tif ( channel == 0 ) {\n\n\t\tvalue = texture2D( texture, xy ).r;\n\n\t} else if ( channel == 1 ) {\n\n\t\tvalue = texture2D( texture, xy ).g;\n\n\t} else if ( channel == 2 ) {\n\n\t\tvalue = texture2D( texture, xy ).b;\n\n\t} else if ( channel == 3 ) {\n\n\t\tvalue = texture2D( texture, xy ).a;\n\n\t}\t\n\n\treturn value;\n\n}\n\nvoid main( void ) {\n\n\t\n\n\t// mRED\r\n\t// mGREEN\r\n\t// mBLUE\r\n\t// mALPHA\r\n\t\n\n\t// glFG\r\n}", // base shader for dynamic generation
-		
-		duplicate:			"// UNPACKED\r\nprecision highp float;\n#define GLSLIFY 1\n\nvarying vec2\t\tUVs;\t\t\t// texture coords of row/column to calculate\r\n\nuniform sampler2D\tA;\t\t\t\t// texture with unpacked data A\r\nuniform int\t\t\tA_channel;\t\t// channel to read data from\r\n\nuniform int\t\t\twrite_channel;\t// channel to write texture to\r\n\nfloat get_channel_value_1540259130( sampler2D texture, int channel, vec2 xy ) {\n\n\tfloat value = 0.0;\n\n\tif ( channel == 0 ) {\n\n\t\tvalue = texture2D( texture, xy ).r;\n\n\t} else if ( channel == 1 ) {\n\n\t\tvalue = texture2D( texture, xy ).g;\n\n\t} else if ( channel == 2 ) {\n\n\t\tvalue = texture2D( texture, xy ).b;\n\n\t} else if ( channel == 3 ) {\n\n\t\tvalue = texture2D( texture, xy ).a;\n\n\t}\t\n\n\treturn value;\n\n}\n\nvec4 set_channel_value_1604150559( int channel, float value ) {\t\n\n\tif ( channel == 0 ) {\n\n\t\treturn vec4( value, 0.0, 0.0, 0.0 );\n\n\t}\n\n\tif ( channel == 1 ) {\n\n\t\treturn vec4( 0.0, value, 0.0, 0.0 );\n\n\t}\n\n\tif ( channel == 2 ) {\n\n\t\treturn vec4( 0.0, 0.0, value, 0.0 );\n\n\t}\n\n\tif ( channel == 3 ) {\n\n\t\treturn vec4( 0.0, 0.0, 0.0, value );\n\n\t}\t\n\n\treturn vec4( 0.0, 0.0, 0.0, 0.0 );\t// should not happen\r\n}\n\nvoid main( void ) {\n\n\tfloat A_value = get_channel_value_1540259130( A, A_channel, UVs );\n\n\tgl_FragColor = set_channel_value_1604150559( write_channel, A_value );\n\n}",
-		//duplicate_full:		glslify('./glsl/duplicate_full.glsl'),
-		duplicate_packed:	"// PACKED TO PACKED\r\nprecision highp float;\n#define GLSLIFY 1\n\nvarying vec2      UVs;\t// texture coords of row/column to calculate\r\n\nuniform sampler2D A;\t\t// texture with data from padded A\r\n\nvoid main( void ) {\t\n\n\tgl_FragColor = texture2D( A, UVs );\n\n}",
-		
-		transpose_unpacked:	"// TRANSPOSE UNPACKED\r\nprecision highp float;\n#define GLSLIFY 1\n\nvarying vec2      \tUVs;\t\t\t// texture coords of row/column to calculate\r\nuniform sampler2D \tA;\t\t\t\t// texture with data from padded A\r\nuniform int\t\t\tA_channel;\t\t// channel to read data from\r\n\nuniform int\t\t\twrite_channel;\t// channel to write texture to\r\n\nfloat get_channel_value_1540259130( sampler2D texture, int channel, vec2 xy ) {\n\n\tfloat value = 0.0;\n\n\tif ( channel == 0 ) {\n\n\t\tvalue = texture2D( texture, xy ).r;\n\n\t} else if ( channel == 1 ) {\n\n\t\tvalue = texture2D( texture, xy ).g;\n\n\t} else if ( channel == 2 ) {\n\n\t\tvalue = texture2D( texture, xy ).b;\n\n\t} else if ( channel == 3 ) {\n\n\t\tvalue = texture2D( texture, xy ).a;\n\n\t}\t\n\n\treturn value;\n\n}\n\nvec4 set_channel_value_1604150559( int channel, float value ) {\t\n\n\tif ( channel == 0 ) {\n\n\t\treturn vec4( value, 0.0, 0.0, 0.0 );\n\n\t}\n\n\tif ( channel == 1 ) {\n\n\t\treturn vec4( 0.0, value, 0.0, 0.0 );\n\n\t}\n\n\tif ( channel == 2 ) {\n\n\t\treturn vec4( 0.0, 0.0, value, 0.0 );\n\n\t}\n\n\tif ( channel == 3 ) {\n\n\t\treturn vec4( 0.0, 0.0, 0.0, value );\n\n\t}\t\n\n\treturn vec4( 0.0, 0.0, 0.0, 0.0 );\t// should not happen\r\n}\n\nvoid main(void) {\n\n\t\n\n\tfloat value = get_channel_value_1540259130( A, A_channel, vec2( UVs.y, UVs.x ) );\t\n\n\tgl_FragColor = set_channel_value_1604150559( write_channel, value );\n\n}"
+		pass_through:		"// Quad pass-through\r\nprecision highp float;\r\n\r\nattribute vec3 position;\r\nattribute vec2 uv;\r\nvarying vec2   UVs;\r\n\r\nvoid main( void ) {\r\n\tgl_Position = vec4( position, 1.0 );\r\n\tUVs = uv;\r\n}\r\n"
 	}
 
 	// Create Shaders	
 	this.shaders = {}
-
-	for ( var shader in this.shaders_src ) {
-		var shaderSource = this.shaders_src[ shader ]
-		var shaderType = gl.FRAGMENT_SHADER
-		if ( shader === 'pass_through' ) shaderType = gl.VERTEX_SHADER
-		this.shaders[ shader ] = this.setupShader( shaderSource, shaderType )
-	}
+	this.shaders.pass_through = this.setupShader( this.shaders_src.pass_through, gl.VERTEX_SHADER )
 	
 	// Create Programs
 	this.programs = {}
-
-	for ( var shader in this.shaders ) {
-		if ( shader !== 'pass_through' ) {
-			this.programs[ shader ] = this.setupProgram( this.shaders.pass_through, this.shaders[ shader ] )
-		}
-	}
 }
 
 TCompute.prototype.setupShader = function( shader_source, type ) {
@@ -187,41 +187,71 @@ TCompute.prototype.setupBuffers = function() {
 	this.buffers = {}
 	
 	var framequad = {}
-	
+
 	// Quad Vertices
-	var quad_vertices = new Float32Array( [
-		-1.0, -1.0, 0.0,	// bottom left
-		 1.0, -1.0, 0.0,	// bottom right
-		 1.0,  1.0, 0.0,	// top right
-		-1.0,  1.0, 0.0		// top left
-	] )
-	framequad.vertexBuffer = gl.createBuffer()
-	gl.bindBuffer( gl.ARRAY_BUFFER, framequad.vertexBuffer )
-	gl.bufferData( gl.ARRAY_BUFFER, quad_vertices, gl.STATIC_DRAW )
-	
+	framequad.vertices = {
+		attribute: 'position',
+		buffer: gl.createBuffer(),
+		data: new Float32Array( [
+			-1.0, -1.0, 0.0,	// bottom left
+			 1.0, -1.0, 0.0,	// bottom right
+			 1.0,  1.0, 0.0,	// top right
+			-1.0,  1.0, 0.0		// top left
+		] )
+	}
+	gl.bindBuffer( gl.ARRAY_BUFFER, framequad.vertices.buffer )
+	gl.bufferData( gl.ARRAY_BUFFER, framequad.vertices.data, gl.STATIC_DRAW )
+
 	// Quad UVs
-	var quad_uvs = new Float32Array( [
-		0.0, 0.0,
-		1.0, 0.0,
-		1.0, 1.0,
-		0.0, 1.0
-	] )
-	framequad.uvBuffer = gl.createBuffer()
-	gl.bindBuffer( gl.ARRAY_BUFFER, framequad.uvBuffer )
-	gl.bufferData( gl.ARRAY_BUFFER, quad_uvs, gl.STATIC_DRAW )
-	
-	// Quad Indices
-	var quad_faces = new Uint16Array( [
-		0, 1, 2,	// bottom right triangle
-		0, 2, 3		// top left triangle
-	] )
-	framequad.elementBuffer = gl.createBuffer()
-	gl.bindBuffer( gl.ELEMENT_ARRAY_BUFFER, framequad.elementBuffer )
-	gl.bufferData( gl.ELEMENT_ARRAY_BUFFER, quad_faces, gl.STATIC_DRAW )
-	
-	framequad.elements_length = quad_faces.length
+	framequad.uvs = {
+		attribute: 'uv',
+		buffer: gl.createBuffer(),
+		data: new Float32Array( [
+			0.0, 0.0,
+			1.0, 0.0,
+			1.0, 1.0,
+			0.0, 1.0
+		] )
+	}
+	gl.bindBuffer( gl.ARRAY_BUFFER, framequad.uvs.buffer )
+	gl.bufferData( gl.ARRAY_BUFFER, framequad.uvs.data, gl.STATIC_DRAW )
+
+	// Quad Elements
+	framequad.elements = {
+		length: 6,
+		buffer: gl.createBuffer(),
+		data: new Uint16Array( [
+			0, 1, 2,	// bottom right triangle
+			0, 2, 3		// top left triangle
+		] )
+	}
+	gl.bindBuffer( gl.ELEMENT_ARRAY_BUFFER, framequad.elements.buffer )
+	gl.bufferData( gl.ELEMENT_ARRAY_BUFFER, framequad.elements.data, gl.STATIC_DRAW )
 	
 	this.buffers.framequad = framequad
+}
+
+TCompute.prototype.setupFramebuffer = function() {
+	var gl = this.context
+	
+	var currentViewport = gl.getParameter( gl.VIEWPORT )
+	var targetViewport = { x: 0, y: 0, z: 2, w: 2 }
+	
+	this.state.viewport( targetViewport )
+	
+	this.framebuffer = gl.createFramebuffer()
+	
+	var texture = this.setupTexture( 2, 2, null, false, gl.RGBA, gl.FLOAT )
+	this.state.bindTexture( gl.TEXTURE_2D, texture )
+	
+	this.state.texImage2D( gl.TEXTURE_2D, 0, gl.RGBA, 2, 2, 0, gl.RGBA, gl.FLOAT, null )
+	gl.bindFramebuffer( gl.FRAMEBUFFER, this.framebuffer )
+	gl.framebufferTexture2D( gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0 )
+
+	if( gl.checkFramebufferStatus( gl.FRAMEBUFFER ) != gl.FRAMEBUFFER_COMPLETE )
+		console.error( 'bindFramebuffer(): Framebuffer not complete' )
+
+	gl.bindFramebuffer( gl.FRAMEBUFFER, null )
 }
 
 /* Create a texture for both input and output
@@ -253,108 +283,109 @@ TCompute.prototype.setupTexture = function( M, N, data, packed, glFormat, glType
 	return texture
 }
 
-TCompute.prototype.setupFramebuffer = function() {
+
+// BINDING
+TCompute.prototype.bindBuffers = function( objects ) {
+	var gl = this.context
+
+	var position = gl.getAttribLocation( this.computePass.program, objects.vertices.attribute )
+	var uv = gl.getAttribLocation( this.computePass.program, objects.uvs.attribute )
+
+	this.state.initAttributes()
+	this.state.enableAttribute( position )
+	this.state.enableAttribute( uv )
+	this.state.disableUnusedAttributes()
+
+	gl.bindBuffer( gl.ARRAY_BUFFER, objects.vertices.buffer )
+	gl.vertexAttribPointer( position, 3, gl.FLOAT, false, 0, 0 )
+
+	gl.bindBuffer( gl.ARRAY_BUFFER, objects.uvs.buffer )
+	gl.vertexAttribPointer( uv, 2, gl.FLOAT, false, 0, 0 )
+
+	gl.bindBuffer( gl.ELEMENT_ARRAY_BUFFER, objects.elements.buffer )
+}
+
+TCompute.prototype.bindFramebuffer = function( framebuffer ) {
 	var gl = this.context
 	
-	var currentViewport = gl.getParameter( gl.VIEWPORT )
-	var targetViewport = { x: 0, y: 0, z: 2, w: 2 }
+	//var currentViewport = gl.getParameter( gl.VIEWPORT )
+	var viewport = { x: 0, y: 0, z: framebuffer.width, w: framebuffer.height }
+	//viewportsEqual( currentViewport, viewport )
 	
-	this.state.viewport( targetViewport )
+	this.state.viewport( viewport )
 	
-	this.framebuffer = gl.createFramebuffer()
-	
-	var texture = this.setupTexture( 2, 2, null, false, gl.RGBA, gl.FLOAT )
-	this.state.bindTexture( gl.TEXTURE_2D, texture )
-	
-	this.state.texImage2D( gl.TEXTURE_2D, 0, gl.RGBA, 2, 2, 0, gl.RGBA, gl.FLOAT, null )
 	gl.bindFramebuffer( gl.FRAMEBUFFER, this.framebuffer )
-	gl.framebufferTexture2D( gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0 )
+	gl.framebufferTexture2D( gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, framebuffer.texture, 0 )
 
 	if( gl.checkFramebufferStatus( gl.FRAMEBUFFER ) != gl.FRAMEBUFFER_COMPLETE )
 		console.error( 'bindFramebuffer(): Framebuffer not complete' )
-
-	gl.bindFramebuffer( gl.FRAMEBUFFER, null )
-}
-
-
-// BINDING
-TCompute.prototype.bindBuffers = function( buffers ) {
-	var gl = this.context
-		
-	var position = gl.getAttribLocation( this.program, 'position' )
-	var texture = gl.getAttribLocation( this.program, 'uv' )
 	
-	this.state.initAttributes()
-	this.state.enableAttribute( position )
-	this.state.enableAttribute( texture )
-	this.state.disableUnusedAttributes()	
+	var uniforms = {}
+
+	if ( framebuffer.bindChannel ) {
+		uniforms[ 'OUTchan' ] = { type: 'uniform1i', value: framebuffer.channel }
+	}
+
+	if ( framebuffer.bindShape ) {
+		var W = framebuffer.width
+		var Whs = ( 1 / W ) * 0.5
+		var H = framebuffer.height
+		var Hhs = ( 1 / H ) * 0.5
 		
-	gl.bindBuffer( gl.ARRAY_BUFFER, buffers.vertexBuffer )
-	gl.vertexAttribPointer( position, 3, gl.FLOAT, false, 0, 0 )
+		uniforms[ 'OUTshape' ] = { type: 'uniform2fv', value: new Float32Array( [ W, H ] ) }
+		uniforms[ 'OUThalfp' ] = { type: 'uniform2fv', value: new Float32Array( [ Whs, Hhs ] ) }
+	}
 
-	gl.bindBuffer( gl.ARRAY_BUFFER, buffers.uvBuffer )	
-	gl.vertexAttribPointer( texture, 2, gl.FLOAT, false, 0, 0 )
-
-	gl.bindBuffer( gl.ELEMENT_ARRAY_BUFFER, buffers.elementBuffer )
+	this.bindUniforms( uniforms )
 }
 
 TCompute.prototype.bindUniforms = function( uniforms ) {
 	var gl = this.context
-	
+
 	for ( var location in uniforms ) {
 		var uniform = uniforms[ location ]
-		//this.bindUniform( uniform.type, uniform.value, location )
 		
-		var uniform_gl = gl.getUniformLocation( this.program, location )
+		var uniform_gl = gl.getUniformLocation( this.computePass.program, location )
 		gl[ uniform.type ]( uniform_gl, uniform.value )
 	}
 }
 
-/*TCompute.prototype.bindUniform = function( type, data, location ) {
+TCompute.prototype.bindTextures = function( textures ) {
 	var gl = this.context
-	
-	var uniform_gl = gl.getUniformLocation( this.program, location )
-	gl[type]( uniform_gl, data )
-}*/
 
-TCompute.prototype.bindTextures = function( tensors ) {
-	var gl = this.context
-	
 	var unit = 0
-	for ( var location in tensors ) {
-		var tensor = tensors[ location ]
-		//this.bindTexture( tensor.texture, unit, location )
-		
+	for ( var location in textures ) {
+		var tensor = textures[ location ].value
+
+		// sampler2D
 		this.state.activeTexture( gl.TEXTURE0 + unit )	
 		this.state.bindTexture( gl.TEXTURE_2D, tensor.texture )
-
-		var uniform_gl = gl.getUniformLocation( this.program, location )
+		
+		var uniform_gl = gl.getUniformLocation( this.computePass.program, location )
 		gl.uniform1i( uniform_gl, unit )
-		
-		// Associated uniforms
-		//this.bindUniform( 'uniform1i', tensor.channel, location + '_channel' )
+
+		// Optional associated uniforms
 		var uniforms = {}
-		
-		uniforms[ location + '_channel' ] = { type: 'uniform1i', value: tensor.channel}
-		
+
+		if ( textures[ location ].bindChannel ) {
+			uniforms[ location + 'chan' ] = { type: 'uniform1i', value: tensor.channel }
+		}
+
+		if ( textures[ location ].bindShape ) {
+			var W = tensor.shape[ 1 ]
+			var Whs = ( 1 / W ) * 0.5
+			var H = tensor.shape[ 0 ]
+			var Hhs = ( 1 / H ) * 0.5
+			
+			uniforms[ location + 'shape' ] = { type: 'uniform2fv', value: new Float32Array( [ W, H ] ) }
+			uniforms[ location + 'halfp' ] = { type: 'uniform2fv', value: new Float32Array( [ Whs, Hhs ] ) }
+		}
+
 		this.bindUniforms( uniforms )
-		
-		// Optional uniforms
-		
+
 		unit++
 	}
 }
-
-/*TCompute.prototype.bindTexture = function( texture, unit, location ) {
-	var gl = this.context
-	
-	this.state.activeTexture( gl.TEXTURE0 + unit )	
-	this.state.bindTexture( gl.TEXTURE_2D, texture )
-
-	var uniform_gl = gl.getUniformLocation( this.program, location )
-	gl.uniform1i( uniform_gl, unit )
-
-}*/
 
 TCompute.prototype.unbindTextures = function( textures ) {
 	var gl = this.context
@@ -369,27 +400,125 @@ TCompute.prototype.unbindTextures = function( textures ) {
 	}
 }
 
-/*TCompute.prototype.unbindTexture = function( unit ) {
+TCompute.prototype.gatherUniforms = function() {
+	var uniforms = {}
+	
+	//var objects = this.computePass.objects	
+	
+	if ( this.computePass.framebuffer.bindChannel ) {
+		uniforms[ 'OUTchan' ] = { type: 'int\t\t', comment: '\t\t// Output channel' }
+	}
+	
+	if ( this.computePass.framebuffer.bindShape ) {		
+		uniforms[ 'OUTshape' ]	= { type: 'vec2\t', comment: '\t\t// Shape: .x = columns, .y = rows' }
+		uniforms[ 'OUThalfp' ]	= { type: 'vec2\t', comment: '\t\t// Half pixel: .x = width, .y = height ' }
+	}
+
+	
+	var data = this.computePass.data
+	var type = {
+		'uniform1f': 'float\t',
+		'uniform1i': 'int\t\t',
+		'sampler2D': 'sampler2D'
+	}
+	for ( var d in data ) {
+		uniforms[ d ] = { type: type[ data[ d ].type ], comment: data[ d ].comment || '' }
+	}
+
+
+	var textures = this.computePass.textures
+	for ( var t in textures ) {		
+		uniforms[ t ] = { type: 'sampler2D', comment: '\t\t\t\t// Texture data' }
+		
+		if ( textures[ t ].bindChannel ) {
+			uniforms[ t + 'chan' ] 	= { type: 'int\t\t', comment: '\t\t\t// Texture channel' }
+		}
+		
+		if ( textures[ t ].bindShape ) {
+			
+			uniforms[ t + 'shape' ]	= { type: 'vec2\t' }
+			uniforms[ t + 'halfp' ]	= { type: 'vec2\t' }
+		}
+	}
+
+	return uniforms
+}
+
+TCompute.prototype.generateProgram = function( program_name, debug ) {
 	var gl = this.context
 	
-	this.state.activeTexture( gl.TEXTURE0 + unit )	
-	this.state.bindTexture(	gl.TEXTURE_2D, null )
-}*/
+	var program_name = 'gen_' + program_name
+	
+	if ( !this.programs.hasOwnProperty( program_name ) ) {
+		// VERTEX
+		//vertex_src += '// ATTRIBUTES\r\n'
+		//var attributes = this.gatherAttributes()
 
-TCompute.prototype.bindFramebuffer = function( height, width, texture ) {
+		// FRAGMENT
+		//var frag_src = this.shaders_src.dynamic_fragment
+		var frag_src = '// Shader: ' + program_name + ' ( generated )\r\n'
+		frag_src += '\r\n'
+		
+		frag_src += '// SETTINGS\r\n'
+		frag_src += 'precision highp float;\r\n'
+		frag_src += '\r\n'
+		
+		frag_src += '// VARYINGS\r\n'
+		frag_src += 'varying vec2\t\tUVs;\r\n'
+		frag_src += '\r\n'
+		//var varyings = this.gatherVaryings()
+		
+		frag_src += '// UNIFORMS\r\n'
+		var uniforms = this.gatherUniforms()
+		
+		var str_uniforms = ''
+		for ( var u in uniforms ) {
+			var uniform = uniforms[ u ]
+			var type = uniform.type
+			var comment = uniform.comment || ''
+			str_uniforms += 'uniform ' + type + '\t ' + u + ';\t' + comment + '\r\n'
+		}
+		frag_src += str_uniforms + '\r\n'		
+		
+		frag_src += '// FUNCTIONS\r\n'
+		var str_functions = ''
+		for ( var f in this.computePass.functions ) {
+			str_functions += this.computePass.functions[ f ] + '\r\n'
+		}
+		frag_src += str_functions + '\r\n'
+		
+		frag_src += '// MAIN\r\n'
+		frag_src += this.computePass.main + '\r\n'
+		
+		if ( debug ) console.log( frag_src )
+
+		// Update cache
+		this.shaders_src[ program_name ] = frag_src
+		this.shaders[ program_name ] = this.setupShader( frag_src, gl.FRAGMENT_SHADER )
+		this.programs[ program_name ] = this.setupProgram( this.shaders.pass_through, this.shaders[ program_name ] )
+	}
+	return this.programs[ program_name ]
+}
+
+TCompute.prototype.renderPass = function() {
 	var gl = this.context
 	
-	//var currentViewport = gl.getParameter( gl.VIEWPORT )
-	var viewport = { x: 0, y: 0, z: width, w: height }
-	//viewportsEqual( currentViewport, viewport )
+	gl.useProgram( this.computePass.program )
 	
-	this.state.viewport( viewport )
+	this.bindBuffers( this.computePass.objects )
 	
-	gl.bindFramebuffer( gl.FRAMEBUFFER, this.framebuffer )
-	gl.framebufferTexture2D( gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0 )
-
-	if( gl.checkFramebufferStatus( gl.FRAMEBUFFER ) != gl.FRAMEBUFFER_COMPLETE )
-		console.error( 'bindFramebuffer(): Framebuffer not complete' )
+	this.bindFramebuffer( this.computePass.framebuffer )
+	
+	this.bindUniforms( this.computePass.data )
+	
+	this.bindTextures( this.computePass.textures )
+	
+	gl.drawElements( gl.TRIANGLES, this.computePass.objects.elements.length, gl.UNSIGNED_SHORT, 0 )
+	
+	this.unbindTextures( this.computePass.textures )
+	
+	// handoff context
+	this.state.resetGL()
 }
 
 /* Read data out as floats
@@ -417,96 +546,89 @@ TCompute.prototype.readFloat = function( M, N, packed ) {
 	return !packed || sub_end == 0 ? readBuffer : readBuffer.subarray( -size, -sub_end )
 }
 
-TCompute.prototype.renderPass = function( output, program, buffers, uniforms, textures ) {
-	var gl = this.context
-	
-	this.program = program
-	
-	gl.useProgram( program )
-	
-	this.bindBuffers( buffers )
-	
-	this.bindUniforms( uniforms )
-	
-	this.bindTextures( textures )
-	
-	this.bindFramebuffer( output.height, output.width, output.texture )
-	
-	gl.drawElements( gl.TRIANGLES, buffers.elements_length, gl.UNSIGNED_SHORT, 0 )
-	
-	this.unbindTextures( textures )
-	
-	// handoff context
-	this.state.resetGL()
-}
-
 /*	float texture read, allows output as packed+deferred or unpacked
  */
 TCompute.prototype.render = function( M, N, tensor, out, packed ) {
-	var output = { width: N, height: M, texture: out }
+	// Objects
+	var objects = this.buffers.framequad
 	
-	var uniforms = {}
+	// Framebuffer
+	var framebuffer = { width: N, height: M, texture: out, channel: out.channel || 0, bindChannel: false, bindShape: true }
+	
+	// Data
+	var data = {}
 
 	if ( packed ) {
 		var W = Math.ceil( N / 4 )
 		var H = M
 		
-		output.width = W
+		framebuffer.width = W
 		
-		var pad = W * 4 - N
+		var Wup = W * 4
+		var Wuphs = ( 1 / Wup ) * 0.5
 		
-		uniforms = {
-			cols: 			{ type: 'uniform1f', value: W },
-			col_hstep: 		{ type: 'uniform1f', value: ( 1 / W ) * 0.5 },
-			rows: 			{ type: 'uniform1f', value: H },
-			row_hstep: 		{ type: 'uniform1f', value: ( 1 / H ) * 0.5 },
-			
-			up_cols: 		{ type: 'uniform1f', value: W * 4 },
-			up_col_hstep: 	{ type: 'uniform1f', value: ( 1 / (W * 4) ) * 0.5 },
-			up_cols_padded: { type: 'uniform1f', value: W * 4 - pad }
+		var pad = Wup - N
+		var Wup_padded = Wup - pad
+		
+		data = {
+			up_cols: 		{ type: 'uniform1f', value: Wup, comment: '\t\t// Unpacked # columns' },
+			up_col_hstep: 	{ type: 'uniform1f', value: Wuphs },
+			up_cols_padded: { type: 'uniform1f', value: Wup_padded, comment: '// Unpacked # columns less padding\r\n' }
 		}
 	}
+
+	// Textures
+	var textures = {}
 	
-	var textures = {
-		A: tensor
+	textures.A = { type: 'sampler2D', value: tensor, bindChannel: true, bindShape: true }
+	
+	// GLSL Functions
+	var functions = {}
+	
+	if ( packed ) {
+		functions.get_indices 		= this.functions_src.get_indices
+		functions.get_coords 		= this.functions_src.get_coords
+		functions.get_channel_value = this.functions_src.get_channel_value
 	}
 	
-	// Dynamic generation occurs here
-	// we have uniforms and textures set and can now include them in shader
+	// GLSL Main
+	var main = packed ? this.main_src.render_packed : this.main_src.render_unpacked
 	
-	// -> extend ability to common functions get/set_channel_value
+	// Shader generation
+	var program_name = 'render' + ( packed ? '_packed' : '' )
+	this.computePass = {
+		objects: 		objects,
+		framebuffer: 	framebuffer,
+		data: 			data,
+		textures: 		textures,
+		functions: 		functions,
+		main: 			main
+	}
 	
-	// -> use caching for generated programs, follow similar method of generate_mixin_program()
+	this.computePass.program = this.generateProgram( program_name, false )
 	
-	// -> externalize ability to write frag shader main() from outside
-	var program = packed ? this.programs.render_packed : this.programs.render_unpacked
-	
-	var buffers = this.buffers.framequad
-	
-	this.renderPass( output, program, buffers, uniforms, textures )
+	this.renderPass()
 }
 
 /*	direct texture float data read (no float encode) - requires OES_texture_float support
  */
 TCompute.prototype.read = function( M, N, tensor, out ) {
-	var output = { width: N, height: M, texture: out }
-	
-	var uniforms = {}
+	// Objects
+	var objects = this.buffers.framequad
+
+	var framebuffer = { width: N, height: M, texture: out, channel: out.channel || 0, bindChannel: false, bindShape: true }
+
+	var data = {}
 
 	if ( tensor.requires_padding ) {
 		var W = Math.ceil( N / 4 )
 		var H = M
 		
-		output.width = W
+		framebuffer.width = W
 		
 		var pad = W * 4 - N
 		
-		uniforms = {
-			cols: 			{ type: 'uniform1f', value: W },
-			col_hstep: 		{ type: 'uniform1f', value: ( 1 / W ) * 0.5 },
-			rows: 			{ type: 'uniform1f', value: H },
-			row_hstep: 		{ type: 'uniform1f', value: ( 1 / H ) * 0.5 },
-			
+		data = {			
 			up_cols: 		{ type: 'uniform1f', value: W * 4 },
 			up_col_hstep: 	{ type: 'uniform1f', value: ( 1 / (W * 4) ) * 0.5 },
 			
@@ -515,150 +637,238 @@ TCompute.prototype.read = function( M, N, tensor, out ) {
 		}
 	}
 	
-	var textures = {
-		A: tensor
+	var textures = {}	
+	textures.A = { type: 'sampler2D', value: tensor, bindChannel: false, bindShape: false }
+
+	// GLSL Functions
+	var functions = {}
+	if ( tensor.requires_padding ) {
+		functions.get_indices 		= this.functions_src.get_indices
+		functions.get_coords 		= this.functions_src.get_coords
+		functions.get_channel_value = this.functions_src.get_channel_value
 	}
 
-	var program = tensor.requires_padding ? this.programs.read_packed_padded : this.programs.read_packed
-	
-	var buffers = this.buffers.framequad
-	
-	this.renderPass( output, program, buffers, uniforms, textures )
+	// GLSL Main
+	var main = tensor.requires_padding ? this.main_src.read_packed_padded : this.main_src.read_packed
+
+	var program_name = 'read_packed' + ( tensor.requires_padding ? '_padded' : '' )
+	this.computePass = {
+		objects: 		objects,
+		framebuffer: 	framebuffer,
+		data: 			data,
+		textures: 		textures,
+		functions: 		functions,
+		main: 			main
+	}
+
+	this.computePass.program = this.generateProgram( program_name, false )
+
+	this.renderPass()
 }
 
 /*	duplicate texture (use in iterative calculations)
  */
 TCompute.prototype.duplicate = function( M, N, tensor, out, packed ) {
-	var output = { width: N, height: M, texture: out.texture }
-	
-	var uniforms = {}
+	var objects = this.buffers.framequad
 
-	if ( !packed ) {		
-		uniforms = {
-			write_channel:	{ type: 'uniform1i', value: out.channel }
-		}
-	}
+	var framebuffer = { width: N, height: M, texture: out.texture, channel: out.channel || 0, bindChannel: true, bindShape: true }
 	
-	var textures = {
-		A: tensor
+	var data = {}
+	
+	var textures = {}
+	textures.A = { type: 'sampler2D', value: tensor, bindChannel: true, bindShape: false }
+
+	// GLSL Functions
+	var functions = {}
+	if ( !packed ) {
+		functions.get_channel_value = this.functions_src.get_channel_value
+		functions.set_channel_value = this.functions_src.set_channel_value
 	}
 
-	var program = !packed ? this.programs.duplicate : this.programs.duplicate_packed
+	// GLSL Main
+	var main = packed ? this.main_src.duplicate_packed : this.main_src.duplicate
+
+	var program_name = 'duplicate' + ( packed ? '_packed' : '' )
+	this.computePass = {
+		objects: 		objects,
+		framebuffer: 	framebuffer,
+		data: 			data,
+		textures: 		textures,
+		functions: 		functions,
+		main: 			main
+	}
+
+	this.computePass.program = this.generateProgram( program_name, false )
 	
-	var buffers = this.buffers.framequad
-	
-	this.renderPass( output, program, buffers, uniforms, textures )
+	this.renderPass()
 }
 
 /*	used to convert a unpacked texture into a packed texture
  */
 TCompute.prototype.pack = function( M, N, tensor, out ) {
-	var output = { width: N, height: M, texture: out }
+	var objects = this.buffers.framequad
 	
-	var uniforms = {}
+	var framebuffer = { width: N, height: M, texture: out, channel: out.channel || 0, bindChannel: true, bindShape: true }
+	
+	var data = {}
 
 	var W = Math.ceil( N / 4 )
 	var H = M
 	
-	uniforms = {
-		cols: 			{ type: 'uniform1f', value: W },
-		col_hstep: 		{ type: 'uniform1f', value: ( 1 / W ) * 0.5 },
-		rows: 			{ type: 'uniform1f', value: H },
-		row_hstep: 		{ type: 'uniform1f', value: ( 1 / H ) * 0.5 },
-		
+	data = {		
 		up_cols: 		{ type: 'uniform1f', value: N },
 		up_col_hstep: 	{ type: 'uniform1f', value: ( 1 / N ) * 0.5 }
 	}
-	
-	var textures = {
-		A: tensor
+
+	var textures = {}
+
+	textures.A = { type: 'sampler2D', value: tensor, bindChannel: true, bindShape: false }
+
+	// GLSL Functions
+	var functions = {}
+	functions.get_indices 		= this.functions_src.get_indices
+	functions.get_coords 		= this.functions_src.get_coords
+	functions.get_channel_value = this.functions_src.get_channel_value
+
+	// GLSL Main
+	var main = this.main_src.pack
+
+	var program_name = 'pack'
+	this.computePass = {
+		objects: 		objects,
+		framebuffer: 	framebuffer,
+		data: 			data,
+		textures: 		textures,
+		functions: 		functions,
+		main: 			main
 	}
 
-	var program = this.programs.pack
+	this.computePass.program = this.generateProgram( program_name, false )
 	
-	var buffers = this.buffers.framequad
-	
-	this.renderPass( output, program, buffers, uniforms, textures )
+	this.renderPass()
 }
 
 /*	used to convert a packed texture (data is held in all RGBA channels)
 	into an unpacked texture (data is held in a selected channel)
  */
 TCompute.prototype.unpack = function( M, N, tensor, out ) {
-	var output = { width: N, height: M, texture: out }
-	
-	var uniforms = {}
+	var objects = this.buffers.framequad
+
+	var framebuffer = { width: N, height: M, texture: out, channel: tensor.channel, bindChannel: true, bindShape: true }
+
+	var data = {}
 
 	var W = N
 	var H = M
-	
-	uniforms = {
-		cols: 			{ type: 'uniform1f', value: W },
-		col_hstep: 		{ type: 'uniform1f', value: ( 1 / W ) * 0.5 },
-		rows: 			{ type: 'uniform1f', value: H },
-		row_hstep: 		{ type: 'uniform1f', value: ( 1 / H ) * 0.5 },
-		
+
+	data = {
 		p_cols: 		{ type: 'uniform1f', value: Math.ceil( W / 4 ) },
-		p_col_hstep: 	{ type: 'uniform1f', value: ( 1 / Math.ceil( W / 4 ) ) * 0.5 },
-		
-		write_channel:	{ type: 'uniform1i', value: tensor.channel }
-	}
-	
-	var textures = {
-		A: tensor
+		p_col_hstep: 	{ type: 'uniform1f', value: ( 1 / Math.ceil( W / 4 ) ) * 0.5 }
 	}
 
-	var program = this.programs.unpack
+	var textures = {}
+
+	textures.A = { type: 'sampler2D', value: tensor, bindChannel: false, bindShape: false }
+
+	// GLSL Functions
+	var functions = {}
+	functions.get_indices 		= this.functions_src.get_indices
+	functions.get_coords 		= this.functions_src.get_coords
+	functions.get_channel_value = this.functions_src.get_channel_value
+	functions.set_channel_value = this.functions_src.set_channel_value
+
+	// GLSL Main
+	var main = this.main_src.unpack
+
+	var program_name = 'unpack'
+	this.computePass = {
+		objects: 		objects,
+		framebuffer: 	framebuffer,
+		data: 			data,
+		textures: 		textures,
+		functions: 		functions,
+		main: 			main
+	}
+
+	this.computePass.program = this.generateProgram( program_name, false )
 	
-	var buffers = this.buffers.framequad
-	
-	this.renderPass( output, program, buffers, uniforms, textures )
+	this.renderPass()
 }
 
 /* tranpose a texture where input has M rows and N columns
  */
 TCompute.prototype.transpose = function( M, N, tensor, out ) {
-	// WARNING! SWITCHED M | N 
-	var output = { width: M, height: N, texture: out.texture }
+	var objects = this.buffers.framequad
 	
-	var uniforms = {}
+	// WARNING! switched M | N for transpose
+	var framebuffer = { width: M, height: N, texture: out.texture, channel: out.channel || 0, bindChannel: true, bindShape: false }
+	
+	var data = {}
 
-	uniforms = {
-		write_channel:	{ type: 'uniform1i', value: out.channel }
+	var textures = {}
+
+	textures.A = { type: 'sampler2D', value: tensor, bindChannel: true, bindShape: false }
+	
+	// GLSL Functions
+	var functions = {}
+	
+	functions.get_channel_value = this.functions_src.get_channel_value
+	functions.set_channel_value = this.functions_src.set_channel_value
+	
+	// GLSL Main
+	var main = this.main_src.transpose
+
+	this.computePass = {
+		objects: 		objects,
+		framebuffer: 	framebuffer,
+		data: 			data,
+		textures: 		textures,
+		functions: 		functions,
+		main: 			main
 	}
 	
-	var textures = {
-		A: tensor
-	}
-
-	var program = this.programs.transpose_unpacked	
+	this.computePass.program = this.generateProgram( 'transpose', false )
 	
-	var buffers = this.buffers.framequad
-	
-	this.renderPass( output, program, buffers, uniforms, textures )
+	this.renderPass()
 }
 
 /*	combine texture channels
  */
 TCompute.prototype.mixin = function( M, N, red, green, blue, alpha, mix ) {
-	var output = { width: N, height: M, texture: mix.texture }
+	var objects = this.buffers.framequad
 	
-	var uniforms = {}
+	var framebuffer = { width: N, height: M, texture: mix.texture, channel: mix.channel || 0, bindChannel: false, bindShape: false }
+	
+	var data = {}
 	var textures = {}
 
-	if ( red != null ) textures.RED = red
-	if ( green != null ) textures.GREEN = green
-	if ( blue != null )	textures.BLUE = blue
-	if ( alpha != null ) textures.ALPHA = alpha
-
-	var program = this.generate_mixin_program( red, green, blue, alpha )
+	if ( red != null ) textures.RED 	= { type: 'sampler2D', value: red, bindChannel: true, bindShape: false }
+	if ( green != null ) textures.GREEN = { type: 'sampler2D', value: green, bindChannel: true, bindShape: false }
+	if ( blue != null )	textures.BLUE 	= { type: 'sampler2D', value: blue, bindChannel: true, bindShape: false }
+	if ( alpha != null ) textures.ALPHA = { type: 'sampler2D', value: alpha, bindChannel: true, bindShape: false }
 	
-	var buffers = this.buffers.framequad
+	// GLSL Functions
+	var functions = {}	
+	functions.get_channel_value = this.functions_src.get_channel_value
 	
-	this.renderPass( output, program, buffers, uniforms, textures )
+	// GLSL Main
+	var main = this.generate_mixin_main( red, green, blue, alpha )
+	
+	this.computePass = {
+		objects: 		objects,
+		framebuffer: 	framebuffer,
+		data: 			data,
+		textures: 		textures,
+		functions: 		functions,
+		main: 			main.source
+	}
+	
+	this.computePass.program = this.generateProgram( main.name, false )
+	
+	this.renderPass()
 }
 
-TCompute.prototype.generate_mixin_program = function( red, green, blue, alpha ) {
+TCompute.prototype.generate_mixin_main = function( red, green, blue, alpha ) {
 	var gl = this.context
 	
 	var r = red != null ? 'r' : 'n'
@@ -668,52 +878,45 @@ TCompute.prototype.generate_mixin_program = function( red, green, blue, alpha ) 
 	
 	// compose name along the pattern "mixin_rgba_program"
 	// where each channel is replaced with "n" if null
-	var program_name = 'mixin_' + r + g + b + a + '_program'
+	var program_name = 'mixin_' + r + g + b + a// + '_program'
 	
-	// generate only if program is inexistent
-	if ( !this.programs.hasOwnProperty( program_name ) ) {
+	var frag_src = ''
+	
+	// generate only if source is inexistent
+	if ( !this.main_src.hasOwnProperty( program_name ) ) {
 
-		var new_frag = this.shaders_src.mixin // dynamic shader base struture
-
-		// glsify appends a numeric code to each 'glsified' shader function
-		// we must source the fragment with this renamed function
-		var get_channel_value_fnc = new RegExp( '(get_channel_value_)(\\d+)' ).exec( new_frag )
+		frag_src = 'void main( void ) {\r\n'
 
 		var uniforms = { 'RED': red, 'GREEN': green, 'BLUE': blue, 'ALPHA': alpha }
 		var values = { 'RED': '0.0', 'GREEN': '0.0', 'BLUE': '0.0', 'ALPHA': '0.0' }
 
 		for ( var key in uniforms ) {
 			if ( uniforms[ key ] != null ) {
-				var new_frag_uniform = 	'uniform sampler2D	' + key + '; 				// texture with unpacked data ' + key + '\r\n' +
-										'uniform int			' + key + '_channel; 		// channel to read data from\r\n'
-
-				var new_frag_value = 	'float ' + key + ' = ' + get_channel_value_fnc[0] + '( ' + key + ', ' + key + '_channel, UVs );\r\n'
-
-				new_frag = new_frag.replace( '// u' + key + '\r\n', new_frag_uniform )
-				new_frag = new_frag.replace( '// m' + key + '\r\n', new_frag_value )
+				frag_src += '\tfloat ' + key + ' = get_channel_value( ' + key + ', ' + key + 'chan, UVs );\r\n'
 
 				values[ key ] = key
 			}
 		}
 
-		var new_glfragcolor = 'gl_FragColor = vec4( ' + values[ 'RED' ] + ', ' +
-														values[ 'GREEN' ] + ', ' +
-														values[ 'BLUE' ] + ', ' +
-														values[ 'ALPHA' ] + ' );\r\n'
+		var glfragcolor = '\tgl_FragColor = vec4( ' + values[ 'RED' ] + ', ' +
+													values[ 'GREEN' ] + ', ' +
+													values[ 'BLUE' ] + ', ' +
+													values[ 'ALPHA' ] + ' );\r\n'
 
-		new_frag = new_frag.replace( '// glFG\r\n', new_glfragcolor )
+		frag_src += glfragcolor		
+		frag_src += '}\r\n'
+		
+		this.main_src[ program_name ] = frag_src
 
-		this.shaders[ program_name ] = this.setupShader( new_frag, gl.FRAGMENT_SHADER )
-		this.programs[ program_name ] = this.setupProgram( this.shaders.pass_through, this.shaders[ program_name ] )
 	}
-	return this.programs[ program_name ]
+	return { name: program_name, source: frag_src }
 }
 
 /*	Basic wraper for some gl methods if THREE not present
 	allows sharing of webgl context
  */
 function TComputeState( gl ) {
-	this.gl = gl // remove
+	this.gl = gl
 }
 
 TComputeState.prototype.initAttributes = function() {}
@@ -733,7 +936,6 @@ TComputeState.prototype.bindTexture = function( textureType, texture ) {
 }
 
 TComputeState.prototype.texImage2D = function() {
-	//target, level, internalformat, width, height, border, format, type, pixels
 	this.gl.texImage2D.apply( this.gl, arguments )
 }
 
