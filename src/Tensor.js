@@ -211,7 +211,7 @@ Tensor.prototype.unpack = function( slot ) {
 	optionally allows to output as unpacked texture
 	defaults to packed type as that is what we usually need on the CPU side
  */
-Tensor.prototype.download = function( keep, unpacked ) {
+Tensor.prototype.download = function( keep, unpacked, pretify ) {
 	var gl = this.gl
 	
 	if ( this.packed ) {
@@ -224,7 +224,8 @@ Tensor.prototype.download = function( keep, unpacked ) {
 	var M = this.shape[0],
 		N = this.shape[1],
 		out,
-		result
+		result,
+		result_str
 	
 	var packed = unpacked === undefined ? true : !unpacked
 	
@@ -241,22 +242,13 @@ Tensor.prototype.download = function( keep, unpacked ) {
 		this.delete()
 	}
 	
-	/*var I = M
-	var J = unpacked ? N * 4 : N
-	var stride = unpacked ? 4 : 1
-	var result_str = ''
-	for ( var i = 0; i < I; i++ ) {
-		var rj = ''
-		for ( var j = 0; j < J; j++ ) {
-			var comma = j === 0 ? '' : ', '
-			var str = result[ i * J * stride + j * stride ]
-			rj += comma + Math.round( str * 10000 ) / 10000
-		}
-		result_str += '\r\n' + rj
+	var prety = pretify === undefined ? false : true
+	if ( prety ) {
+		result_str = pretifyTensor( { shape: this.shape, data: result, packed: packed } )
+		result = { data: result, string: result_str }
 	}
-	console.log( result_str )*/
 	
-return result
+	return result
 }
 
 /*	Facility to clone textures, for in-GPU staged computations
@@ -307,6 +299,78 @@ Tensor.prototype.mixin = function ( red, green, blue, alpha ) {
 	
 	// delete
 	//gl.context.deleteTexture( old_texture )
+}
+
+function pretifyTensor( tensor ) {
+	var shape = tensor.shape
+	var array = tensor.data
+	var packed = tensor.packed
+	
+	var M = shape[ 0 ]
+	var N = packed ? shape[ 1 ] : shape[ 1 ] * 4
+	var stride = 1
+	var result_str = ''
+	
+	var max = 0
+	var anyFraction = false
+	for ( var i = 0; i < M * N; i++ ) {
+		var value = array[ i ]
+		max = value > max ? value : max
+		if ( value % 1 !== 0 ) anyFraction = true
+	}
+	var maxFD = anyFraction ? 3 : 0
+	var maxID = 1
+	for ( var i = 1; i < 6; i++ ) {
+		var floor = Math.pow( 10, i )
+		var ceil = Math.pow( 10, i + 1 )
+		if ( max >= floor && value < ceil ) maxID = i + 1
+	}
+
+	var maxD = maxID + 0 + maxFD
+	for ( var i = 0; i < M; i++ ) {
+		var rj = ''
+		for ( var j = 0; j < N; j++ ) {
+			var fourths = j % 4 === 3
+			var first = j === 0
+			var last = j + 1 === N
+			
+			var pixel = fourths && !first && !last ? ' | ' : ''
+			var comma = ( !fourths || first ) && !last ? ', ' : ''
+			
+			var value = array[ i * N * stride + j * stride ]
+			var value_str = fillString( value, maxD, maxFD )
+			
+			rj += value_str + comma + pixel
+		}
+		var endl = i + 1 === M ? '' : '\r\n'
+		result_str += rj + endl
+	}
+	var packed_str = packed ? 'Packed' : 'Unpacked'
+	var info = 'Shape: ' + M + 'x' + N + ' | ' + packed_str + '\r\n'
+	return info + result_str
+}
+
+function fillString( value, digits, fraction ) {
+	var maxID = 1
+	for ( var i = 1; i < 6; i++ ) {
+		var floor = Math.pow( 10, i )
+		var ceil = Math.pow( 10, i + 1 )
+		if ( value >= floor && value < ceil ) maxID = i + 1
+	}
+	var length = digits - maxID - fraction
+	var v = new Intl.NumberFormat( 'en-IN', {
+			useGrouping: false,
+			//maximumSignificantDigits: 2
+			minimumIntegerDigits: 1,
+			//maximumIntegerDigits: i,
+			minimumFractionDigits: fraction,
+			maximumFractionDigits: fraction
+		} ).format( value )
+	var s = String( v )
+	var pre = ' '.repeat( length )
+	var pos = ''
+	var ss = pre + v + pos
+	return ss
 }
 
 function selfout( tensors, self ) {
