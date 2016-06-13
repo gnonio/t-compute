@@ -1,7 +1,11 @@
 void main( void ) {
-	// get the implied row and column from .t and .s of passed (output) texture coordinate.
 	float col_t = UVs.s;
 	float row_t = UVs.t;
+	/*#ifdef FLIPY
+	float row_t = 1.0 - UVs.t;
+	#else
+	float row_t = UVs.t;
+	#endif*/
 
 	// get the implied row and column indices
 	vec2 rowcol = get_indices( col_t, OUTshape.x, row_t, OUTshape.y );

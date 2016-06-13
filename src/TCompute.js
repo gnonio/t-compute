@@ -16,6 +16,10 @@ try {
 
 module.exports = TCompute // Standalone
 
+var _instances = []
+
+var _shaderSources = {}
+
 /**
  * Manages webgl context
  * 
@@ -25,6 +29,8 @@ module.exports = TCompute // Standalone
 function TCompute( renderer ) {
 	var gl,
 		state
+
+	_instances.push( this )
 
 	if ( renderer === undefined ) {
 		renderer = this
@@ -73,6 +79,10 @@ function TCompute( renderer ) {
 	this.setupFramebuffer()
 }
 
+TCompute.getInstances = function() {
+	return _instances
+}
+
 TCompute.prototype.setupRenderer = function( renderer ) {
 	// must dispose of programs, buffers and framebuffer if reinitializing
 	
@@ -97,6 +107,7 @@ TCompute.prototype.setupPrograms = function() {
 		set_channel_value:	fs.readFileSync('./src/glsl/f_set_channel_value.glsl', 'utf8'),
 		mix_channel_value:	fs.readFileSync('./src/glsl/f_mix_channel_value.glsl', 'utf8')
 	}
+	_shaderSources.functions = this.functions_src
 	
 	// Shader main function sources
 	this.main_src = {
@@ -110,11 +121,13 @@ TCompute.prototype.setupPrograms = function() {
 		unpack:				fs.readFileSync('./src/glsl/m_unpack.glsl', 'utf8'),
 		transpose:			fs.readFileSync('./src/glsl/m_transpose.glsl', 'utf8')
 	}
+	_shaderSources.main = this.main_src
 	
 	// Shader sources
 	this.shaders_src = {
 		pass_through:		fs.readFileSync('./src/glsl/pass_through.glsl', 'utf8')
 	}
+	_shaderSources.shaders = this.shaders_src
 
 	// Create Shaders	
 	this.shaders = {}
@@ -495,6 +508,7 @@ TCompute.prototype.generateProgram = function( program_name, debug ) {
 		this.shaders_src[ program_name ] = frag_src
 		this.shaders[ program_name ] = this.setupShader( frag_src, gl.FRAGMENT_SHADER )
 		this.programs[ program_name ] = this.setupProgram( this.shaders.pass_through, this.shaders[ program_name ] )
+		console.log( 'generateProgram(): ' + program_name + ' program added.')
 	}
 	return this.programs[ program_name ]
 }
@@ -591,10 +605,11 @@ TCompute.prototype.render = function( M, N, tensor, out, packed ) {
 	}
 	
 	// GLSL Main
-	var main = packed ? this.main_src.render_packed : this.main_src.render_unpacked
+	var flipy = tensor.isInput ? '' : '' //'#define FLIPY\r\n'
+	var main = packed ? flipy + this.main_src.render_packed : flipy + this.main_src.render_unpacked
 	
 	// Shader generation
-	var program_name = 'render' + ( packed ? '_packed' : '' )
+	var program_name = 'render' + ( packed ? '_packed' : '' )// + ( tensor.isInput ? '_flipy' : '' )
 	this.computePass = {
 		objects: 		objects,
 		framebuffer: 	framebuffer,
@@ -685,9 +700,11 @@ TCompute.prototype.duplicate = function( M, N, tensor, out, packed ) {
 	}
 
 	// GLSL Main
-	var main = packed ? this.main_src.duplicate_packed : this.main_src.duplicate
-
-	var program_name = 'duplicate' + ( packed ? '_packed' : '' )
+	var flipy = tensor.isInput ? '' : '' // '#define FLIPY\r\n'
+	var main = packed ? flipy + this.main_src.duplicate_packed : flipy + this.main_src.duplicate
+	
+	// Shader generation
+	var program_name = 'duplicate' + ( packed ? '_packed' : '' ) + ( tensor.isInput ? '_flipy' : '' )
 	this.computePass = {
 		objects: 		objects,
 		framebuffer: 	framebuffer,
@@ -759,10 +776,14 @@ TCompute.prototype.unpack = function( M, N, tensor, out ) {
 
 	var W = N
 	var H = M
+	
+	var p_cols = Math.ceil( W / 4 )
+	var p_col_hstep = ( 1 / p_cols ) * 0.5
+	//console.log( 'unpack', p_cols, p_col_hstep )
 
 	data = {
-		p_cols: 		{ type: 'uniform1f', value: Math.ceil( W / 4 ) },
-		p_col_hstep: 	{ type: 'uniform1f', value: ( 1 / Math.ceil( W / 4 ) ) * 0.5 }
+		p_cols: 		{ type: 'uniform1f', value: p_cols },
+		p_col_hstep: 	{ type: 'uniform1f', value: p_col_hstep }
 	}
 
 	var textures = {}
