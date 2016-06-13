@@ -13,4 +13,3 @@ vec4 mix_channel_value( vec4 rgba, int channel, float value ) {
 	}
 	return rgba;
 }
-#pragma glslify: export(mix_channel_value)

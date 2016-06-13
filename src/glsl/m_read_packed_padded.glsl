@@ -1,32 +1,10 @@
-// PACKED TO PACKED (PADDED)
-precision highp float;
-
-varying vec2		UVs;			// texture coords of row/column to calculate
-
-uniform float		cols;			// number of columns
-uniform float		col_hstep;		// half step in texture space
-uniform float		rows;			// number of rows
-uniform float		row_hstep;		// half step in texture space
-
-uniform float		up_cols;		// number of unpacked columns
-uniform float		up_col_hstep;	// half step in texture space
-
-uniform float		pad;			// number of unpacked columns accounting padding
-uniform float		up_cols_padded;	// number of unpacked columns accounting padding
-
-uniform sampler2D	A;				// texture with data from padded A
-
-#pragma glslify: get_indices = require(./get_indices)
-#pragma glslify: get_coords = require(./get_coords)
-#pragma glslify: get_channel_value = require(./get_channel_value)
-
-void main(void) {
+void main( void ) {
 	// get the implied row and column from .t and .s of passed (output) texture coordinate.
 	float col_t = UVs.s;
 	float row_t = UVs.t;
 	
 	// get the implied row and column indices
-	vec2 rowcol = get_indices( col_t, cols, row_t, rows );
+	vec2 rowcol = get_indices( col_t, OUTshape.x, row_t, OUTshape.y );
 	
 	// this pixel index as if unpacked (up_cols = cols * 4.0)
 	float index = rowcol.y * up_cols + rowcol.x * 4.0;
@@ -57,10 +35,10 @@ void main(void) {
 	
 	// can be optimized, at most 2 pixels should be read
 	// get the sequence of coordinates of texture as if unpacked
-	vec2 up_s = get_coords( nindex_r, up_cols, up_col_hstep, rows, row_hstep );
-	vec2 up_t = get_coords( nindex_g, up_cols, up_col_hstep, rows, row_hstep );
-	vec2 up_p = get_coords( nindex_b, up_cols, up_col_hstep, rows, row_hstep );
-	vec2 up_q = get_coords( nindex_a, up_cols, up_col_hstep, rows, row_hstep );
+	vec2 up_s = get_coords( nindex_r, up_cols, up_col_hstep, OUTshape.y, OUThalfp.y );
+	vec2 up_t = get_coords( nindex_g, up_cols, up_col_hstep, OUTshape.y, OUThalfp.y );
+	vec2 up_p = get_coords( nindex_b, up_cols, up_col_hstep, OUTshape.y, OUThalfp.y );
+	vec2 up_q = get_coords( nindex_a, up_cols, up_col_hstep, OUTshape.y, OUThalfp.y );
 	
 	// read four values from texture considering the new channels 
 	float r = get_channel_value( A, int(nchannel_r), up_s );

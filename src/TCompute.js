@@ -6,7 +6,7 @@
  *
  */
 
-var glslify = require('glslify')
+var fs = require('fs')
 
 try {
 	if ( Number( THREE.REVISION ) >= 76 ) {
@@ -15,6 +15,10 @@ try {
 } catch ( error ) {}
 
 module.exports = TCompute // Standalone
+
+var _instances = []
+
+var _shaderSources = {}
 
 /**
  * Manages webgl context
@@ -25,6 +29,8 @@ module.exports = TCompute // Standalone
 function TCompute( renderer ) {
 	var gl,
 		state
+
+	_instances.push( this )
 
 	if ( renderer === undefined ) {
 		renderer = this
@@ -39,7 +45,7 @@ function TCompute( renderer ) {
 		state.resetGL = renderer.resetGLState
 	}
 	
-	if ( typeof gl === undefined )
+	if ( gl === undefined )
 		console.error( 'Unable to setup WebGL context.' )
 	
 	this.renderer = renderer
@@ -60,6 +66,9 @@ function TCompute( renderer ) {
 		this.float_support = true
 	}
 	
+	// Compute Pass
+	this.computePass = {}
+	
 	// Programs
 	this.setupPrograms()
 	
@@ -70,7 +79,13 @@ function TCompute( renderer ) {
 	this.setupFramebuffer()
 }
 
+TCompute.getInstances = function() {
+	return _instances
+}
+
 TCompute.prototype.setupRenderer = function( renderer ) {
+	// must dispose of programs, buffers and framebuffer if reinitializing
+	
 	var gl = renderer.context
 	var state = renderer.state
 	state.resetGL = renderer.resetGLState
@@ -84,44 +99,42 @@ TCompute.prototype.setupRenderer = function( renderer ) {
 TCompute.prototype.setupPrograms = function() {
 	var gl = this.context
 	
-	// Shader list sources
-	this.shaders_src = {
-		pass_through:		glslify('./glsl/pass_through.glsl'),
-		
-		read_packed:		glslify('./glsl/read_packed.glsl'),
-		read_packed_padded:	glslify('./glsl/read_packed_padded.glsl'),
-		pack:				glslify('./glsl/pack.glsl'),
-		unpack:				glslify('./glsl/unpack.glsl'),
-		render_packed:		glslify('./glsl/render_packed.glsl'),
-		render_unpacked:	glslify('./glsl/render_unpacked.glsl'),
-		
-		mixin:				glslify('./glsl/mixin.glsl'), // base shader for dynamic generation
-		
-		duplicate:			glslify('./glsl/duplicate.glsl'),
-		//duplicate_full:		glslify('./glsl/duplicate_full.glsl'),
-		duplicate_packed:	glslify('./glsl/duplicate_packed.glsl'),
-		
-		transpose_unpacked:	glslify('./glsl/transpose_unpacked.glsl')
+	// Shader common function sources
+	this.functions_src = {
+		get_indices:		fs.readFileSync('./src/glsl/f_get_indices.glsl', 'utf8'),
+		get_coords:			fs.readFileSync('./src/glsl/f_get_coords.glsl', 'utf8'),
+		get_channel_value:	fs.readFileSync('./src/glsl/f_get_channel_value.glsl', 'utf8'),
+		set_channel_value:	fs.readFileSync('./src/glsl/f_set_channel_value.glsl', 'utf8'),
+		mix_channel_value:	fs.readFileSync('./src/glsl/f_mix_channel_value.glsl', 'utf8')
 	}
+	_shaderSources.functions = this.functions_src
+	
+	// Shader main function sources
+	this.main_src = {
+		render_unpacked:	fs.readFileSync('./src/glsl/m_render_unpacked.glsl', 'utf8'),
+		render_packed:		fs.readFileSync('./src/glsl/m_render_packed.glsl', 'utf8'),
+		read_packed:		fs.readFileSync('./src/glsl/m_read_packed.glsl', 'utf8'),
+		read_packed_padded:	fs.readFileSync('./src/glsl/m_read_packed_padded.glsl', 'utf8'),
+		duplicate:			fs.readFileSync('./src/glsl/m_duplicate.glsl', 'utf8'),
+		duplicate_packed:	fs.readFileSync('./src/glsl/m_duplicate_packed.glsl', 'utf8'),
+		pack:				fs.readFileSync('./src/glsl/m_pack.glsl', 'utf8'),
+		unpack:				fs.readFileSync('./src/glsl/m_unpack.glsl', 'utf8'),
+		transpose:			fs.readFileSync('./src/glsl/m_transpose.glsl', 'utf8')
+	}
+	_shaderSources.main = this.main_src
+	
+	// Shader sources
+	this.shaders_src = {
+		pass_through:		fs.readFileSync('./src/glsl/pass_through.glsl', 'utf8')
+	}
+	_shaderSources.shaders = this.shaders_src
 
 	// Create Shaders	
 	this.shaders = {}
-
-	for ( var shader in this.shaders_src ) {
-		var shaderSource = this.shaders_src[ shader ]
-		var shaderType = gl.FRAGMENT_SHADER
-		if ( shader === 'pass_through' ) shaderType = gl.VERTEX_SHADER
-		this.shaders[ shader ] = this.setupShader( shaderSource, shaderType )
-	}
+	this.shaders.pass_through = this.setupShader( this.shaders_src.pass_through, gl.VERTEX_SHADER )
 	
 	// Create Programs
 	this.programs = {}
-
-	for ( var shader in this.shaders ) {
-		if ( shader !== 'pass_through' ) {
-			this.programs[ shader ] = this.setupProgram( this.shaders.pass_through, this.shaders[ shader ] )
-		}
-	}
 }
 
 TCompute.prototype.setupShader = function( shader_source, type ) {
@@ -186,41 +199,71 @@ TCompute.prototype.setupBuffers = function() {
 	this.buffers = {}
 	
 	var framequad = {}
-	
+
 	// Quad Vertices
-	var quad_vertices = new Float32Array( [
-		-1.0, -1.0, 0.0,	// bottom left
-		 1.0, -1.0, 0.0,	// bottom right
-		 1.0,  1.0, 0.0,	// top right
-		-1.0,  1.0, 0.0		// top left
-	] )
-	framequad.vertexBuffer = gl.createBuffer()
-	gl.bindBuffer( gl.ARRAY_BUFFER, framequad.vertexBuffer )
-	gl.bufferData( gl.ARRAY_BUFFER, quad_vertices, gl.STATIC_DRAW )
-	
+	framequad.vertices = {
+		attribute: 'position',
+		buffer: gl.createBuffer(),
+		data: new Float32Array( [
+			-1.0, -1.0, 0.0,	// bottom left
+			 1.0, -1.0, 0.0,	// bottom right
+			 1.0,  1.0, 0.0,	// top right
+			-1.0,  1.0, 0.0		// top left
+		] )
+	}
+	gl.bindBuffer( gl.ARRAY_BUFFER, framequad.vertices.buffer )
+	gl.bufferData( gl.ARRAY_BUFFER, framequad.vertices.data, gl.STATIC_DRAW )
+
 	// Quad UVs
-	var quad_uvs = new Float32Array( [
-		0.0, 0.0,
-		1.0, 0.0,
-		1.0, 1.0,
-		0.0, 1.0
-	] )
-	framequad.uvBuffer = gl.createBuffer()
-	gl.bindBuffer( gl.ARRAY_BUFFER, framequad.uvBuffer )
-	gl.bufferData( gl.ARRAY_BUFFER, quad_uvs, gl.STATIC_DRAW )
-	
-	// Quad Indices
-	var quad_faces = new Uint16Array( [
-		0, 1, 2,	// bottom right triangle
-		0, 2, 3		// top left triangle
-	] )
-	framequad.elementBuffer = gl.createBuffer()
-	gl.bindBuffer( gl.ELEMENT_ARRAY_BUFFER, framequad.elementBuffer )
-	gl.bufferData( gl.ELEMENT_ARRAY_BUFFER, quad_faces, gl.STATIC_DRAW )
-	
-	framequad.elements_length = quad_faces.length
+	framequad.uvs = {
+		attribute: 'uv',
+		buffer: gl.createBuffer(),
+		data: new Float32Array( [
+			0.0, 0.0,
+			1.0, 0.0,
+			1.0, 1.0,
+			0.0, 1.0
+		] )
+	}
+	gl.bindBuffer( gl.ARRAY_BUFFER, framequad.uvs.buffer )
+	gl.bufferData( gl.ARRAY_BUFFER, framequad.uvs.data, gl.STATIC_DRAW )
+
+	// Quad Elements
+	framequad.elements = {
+		length: 6,
+		buffer: gl.createBuffer(),
+		data: new Uint16Array( [
+			0, 1, 2,	// bottom right triangle
+			0, 2, 3		// top left triangle
+		] )
+	}
+	gl.bindBuffer( gl.ELEMENT_ARRAY_BUFFER, framequad.elements.buffer )
+	gl.bufferData( gl.ELEMENT_ARRAY_BUFFER, framequad.elements.data, gl.STATIC_DRAW )
 	
 	this.buffers.framequad = framequad
+}
+
+TCompute.prototype.setupFramebuffer = function() {
+	var gl = this.context
+	
+	var currentViewport = gl.getParameter( gl.VIEWPORT )
+	var targetViewport = { x: 0, y: 0, z: 2, w: 2 }
+	
+	this.state.viewport( targetViewport )
+	
+	this.framebuffer = gl.createFramebuffer()
+	
+	var texture = this.setupTexture( 2, 2, null, false, gl.RGBA, gl.FLOAT )
+	this.state.bindTexture( gl.TEXTURE_2D, texture )
+	
+	this.state.texImage2D( gl.TEXTURE_2D, 0, gl.RGBA, 2, 2, 0, gl.RGBA, gl.FLOAT, null )
+	gl.bindFramebuffer( gl.FRAMEBUFFER, this.framebuffer )
+	gl.framebufferTexture2D( gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0 )
+
+	if( gl.checkFramebufferStatus( gl.FRAMEBUFFER ) != gl.FRAMEBUFFER_COMPLETE )
+		console.error( 'bindFramebuffer(): Framebuffer not complete' )
+
+	gl.bindFramebuffer( gl.FRAMEBUFFER, null )
 }
 
 /* Create a texture for both input and output
@@ -252,108 +295,109 @@ TCompute.prototype.setupTexture = function( M, N, data, packed, glFormat, glType
 	return texture
 }
 
-TCompute.prototype.setupFramebuffer = function() {
+
+// BINDING
+TCompute.prototype.bindBuffers = function( objects ) {
+	var gl = this.context
+
+	var position = gl.getAttribLocation( this.computePass.program, objects.vertices.attribute )
+	var uv = gl.getAttribLocation( this.computePass.program, objects.uvs.attribute )
+
+	this.state.initAttributes()
+	this.state.enableAttribute( position )
+	this.state.enableAttribute( uv )
+	this.state.disableUnusedAttributes()
+
+	gl.bindBuffer( gl.ARRAY_BUFFER, objects.vertices.buffer )
+	gl.vertexAttribPointer( position, 3, gl.FLOAT, false, 0, 0 )
+
+	gl.bindBuffer( gl.ARRAY_BUFFER, objects.uvs.buffer )
+	gl.vertexAttribPointer( uv, 2, gl.FLOAT, false, 0, 0 )
+
+	gl.bindBuffer( gl.ELEMENT_ARRAY_BUFFER, objects.elements.buffer )
+}
+
+TCompute.prototype.bindFramebuffer = function( framebuffer ) {
 	var gl = this.context
 	
-	var currentViewport = gl.getParameter( gl.VIEWPORT )
-	var targetViewport = { x: 0, y: 0, z: 2, w: 2 }
+	//var currentViewport = gl.getParameter( gl.VIEWPORT )
+	var viewport = { x: 0, y: 0, z: framebuffer.width, w: framebuffer.height }
+	//viewportsEqual( currentViewport, viewport )
 	
-	this.state.viewport( targetViewport )
+	this.state.viewport( viewport )
 	
-	this.framebuffer = gl.createFramebuffer()
-	
-	var texture = this.setupTexture( 2, 2, null, false, gl.RGBA, gl.FLOAT )
-	this.state.bindTexture( gl.TEXTURE_2D, texture )
-	
-	this.state.texImage2D( gl.TEXTURE_2D, 0, gl.RGBA, 2, 2, 0, gl.RGBA, gl.FLOAT, null )
 	gl.bindFramebuffer( gl.FRAMEBUFFER, this.framebuffer )
-	gl.framebufferTexture2D( gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0 )
+	gl.framebufferTexture2D( gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, framebuffer.texture, 0 )
 
 	if( gl.checkFramebufferStatus( gl.FRAMEBUFFER ) != gl.FRAMEBUFFER_COMPLETE )
 		console.error( 'bindFramebuffer(): Framebuffer not complete' )
-
-	gl.bindFramebuffer( gl.FRAMEBUFFER, null )
-}
-
-
-// BINDING
-TCompute.prototype.bindBuffers = function( buffers ) {
-	var gl = this.context
-		
-	var position = gl.getAttribLocation( this.program, 'position' )
-	var texture = gl.getAttribLocation( this.program, 'uv' )
 	
-	this.state.initAttributes()
-	this.state.enableAttribute( position )
-	this.state.enableAttribute( texture )
-	this.state.disableUnusedAttributes()	
+	var uniforms = {}
+
+	if ( framebuffer.bindChannel ) {
+		uniforms[ 'OUTchan' ] = { type: 'uniform1i', value: framebuffer.channel }
+	}
+
+	if ( framebuffer.bindShape ) {
+		var W = framebuffer.width
+		var Whs = ( 1 / W ) * 0.5
+		var H = framebuffer.height
+		var Hhs = ( 1 / H ) * 0.5
 		
-	gl.bindBuffer( gl.ARRAY_BUFFER, buffers.vertexBuffer )
-	gl.vertexAttribPointer( position, 3, gl.FLOAT, false, 0, 0 )
+		uniforms[ 'OUTshape' ] = { type: 'uniform2fv', value: new Float32Array( [ W, H ] ) }
+		uniforms[ 'OUThalfp' ] = { type: 'uniform2fv', value: new Float32Array( [ Whs, Hhs ] ) }
+	}
 
-	gl.bindBuffer( gl.ARRAY_BUFFER, buffers.uvBuffer )	
-	gl.vertexAttribPointer( texture, 2, gl.FLOAT, false, 0, 0 )
-
-	gl.bindBuffer( gl.ELEMENT_ARRAY_BUFFER, buffers.elementBuffer )
+	this.bindUniforms( uniforms )
 }
 
 TCompute.prototype.bindUniforms = function( uniforms ) {
 	var gl = this.context
-	
+
 	for ( var location in uniforms ) {
 		var uniform = uniforms[ location ]
-		//this.bindUniform( uniform.type, uniform.value, location )
 		
-		var uniform_gl = gl.getUniformLocation( this.program, location )
+		var uniform_gl = gl.getUniformLocation( this.computePass.program, location )
 		gl[ uniform.type ]( uniform_gl, uniform.value )
 	}
 }
 
-/*TCompute.prototype.bindUniform = function( type, data, location ) {
+TCompute.prototype.bindTextures = function( textures ) {
 	var gl = this.context
-	
-	var uniform_gl = gl.getUniformLocation( this.program, location )
-	gl[type]( uniform_gl, data )
-}*/
 
-TCompute.prototype.bindTextures = function( tensors ) {
-	var gl = this.context
-	
 	var unit = 0
-	for ( var location in tensors ) {
-		var tensor = tensors[ location ]
-		//this.bindTexture( tensor.texture, unit, location )
-		
+	for ( var location in textures ) {
+		var tensor = textures[ location ].value
+
+		// sampler2D
 		this.state.activeTexture( gl.TEXTURE0 + unit )	
 		this.state.bindTexture( gl.TEXTURE_2D, tensor.texture )
-
-		var uniform_gl = gl.getUniformLocation( this.program, location )
+		
+		var uniform_gl = gl.getUniformLocation( this.computePass.program, location )
 		gl.uniform1i( uniform_gl, unit )
-		
-		// Associated uniforms
-		//this.bindUniform( 'uniform1i', tensor.channel, location + '_channel' )
+
+		// Optional associated uniforms
 		var uniforms = {}
-		
-		uniforms[ location + '_channel' ] = { type: 'uniform1i', value: tensor.channel}
-		
+
+		if ( textures[ location ].bindChannel ) {
+			uniforms[ location + 'chan' ] = { type: 'uniform1i', value: tensor.channel }
+		}
+
+		if ( textures[ location ].bindShape ) {
+			var W = tensor.shape[ 1 ]
+			var Whs = ( 1 / W ) * 0.5
+			var H = tensor.shape[ 0 ]
+			var Hhs = ( 1 / H ) * 0.5
+			
+			uniforms[ location + 'shape' ] = { type: 'uniform2fv', value: new Float32Array( [ W, H ] ) }
+			uniforms[ location + 'halfp' ] = { type: 'uniform2fv', value: new Float32Array( [ Whs, Hhs ] ) }
+		}
+
 		this.bindUniforms( uniforms )
-		
-		// Optional uniforms
-		
+
 		unit++
 	}
 }
-
-/*TCompute.prototype.bindTexture = function( texture, unit, location ) {
-	var gl = this.context
-	
-	this.state.activeTexture( gl.TEXTURE0 + unit )	
-	this.state.bindTexture( gl.TEXTURE_2D, texture )
-
-	var uniform_gl = gl.getUniformLocation( this.program, location )
-	gl.uniform1i( uniform_gl, unit )
-
-}*/
 
 TCompute.prototype.unbindTextures = function( textures ) {
 	var gl = this.context
@@ -368,27 +412,126 @@ TCompute.prototype.unbindTextures = function( textures ) {
 	}
 }
 
-/*TCompute.prototype.unbindTexture = function( unit ) {
+TCompute.prototype.gatherUniforms = function() {
+	var uniforms = {}
+	
+	//var objects = this.computePass.objects	
+	
+	if ( this.computePass.framebuffer.bindChannel ) {
+		uniforms[ 'OUTchan' ] = { type: 'int\t\t', comment: '\t\t// Output channel' }
+	}
+	
+	if ( this.computePass.framebuffer.bindShape ) {		
+		uniforms[ 'OUTshape' ]	= { type: 'vec2\t', comment: '\t\t// Shape: .x = columns, .y = rows' }
+		uniforms[ 'OUThalfp' ]	= { type: 'vec2\t', comment: '\t\t// Half pixel: .x = width, .y = height ' }
+	}
+
+	
+	var data = this.computePass.data
+	var type = {
+		'uniform1f': 'float\t',
+		'uniform1i': 'int\t\t',
+		'sampler2D': 'sampler2D'
+	}
+	for ( var d in data ) {
+		uniforms[ d ] = { type: type[ data[ d ].type ], comment: data[ d ].comment || '' }
+	}
+
+
+	var textures = this.computePass.textures
+	for ( var t in textures ) {		
+		uniforms[ t ] = { type: 'sampler2D', comment: '\t\t\t\t// Texture data' }
+		
+		if ( textures[ t ].bindChannel ) {
+			uniforms[ t + 'chan' ] 	= { type: 'int\t\t', comment: '\t\t\t// Texture channel' }
+		}
+		
+		if ( textures[ t ].bindShape ) {
+			
+			uniforms[ t + 'shape' ]	= { type: 'vec2\t' }
+			uniforms[ t + 'halfp' ]	= { type: 'vec2\t' }
+		}
+	}
+
+	return uniforms
+}
+
+TCompute.prototype.generateProgram = function( program_name, debug ) {
 	var gl = this.context
 	
-	this.state.activeTexture( gl.TEXTURE0 + unit )	
-	this.state.bindTexture(	gl.TEXTURE_2D, null )
-}*/
+	var program_name = 'gen_' + program_name
+	
+	if ( !this.programs.hasOwnProperty( program_name ) ) {
+		// VERTEX
+		//vertex_src += '// ATTRIBUTES\r\n'
+		//var attributes = this.gatherAttributes()
 
-TCompute.prototype.bindFramebuffer = function( height, width, texture ) {
+		// FRAGMENT
+		//var frag_src = this.shaders_src.dynamic_fragment
+		var frag_src = '// Shader: ' + program_name + ' ( generated )\r\n'
+		frag_src += '\r\n'
+		
+		frag_src += '// SETTINGS\r\n'
+		frag_src += 'precision highp float;\r\n'
+		frag_src += '\r\n'
+		
+		frag_src += '// VARYINGS\r\n'
+		frag_src += 'varying vec2\t\tUVs;\r\n'
+		frag_src += '\r\n'
+		//var varyings = this.gatherVaryings()
+		
+		frag_src += '// UNIFORMS\r\n'
+		var uniforms = this.gatherUniforms()
+		
+		var str_uniforms = ''
+		for ( var u in uniforms ) {
+			var uniform = uniforms[ u ]
+			var type = uniform.type
+			var comment = uniform.comment || ''
+			str_uniforms += 'uniform ' + type + '\t ' + u + ';\t' + comment + '\r\n'
+		}
+		frag_src += str_uniforms + '\r\n'		
+		
+		frag_src += '// FUNCTIONS\r\n'
+		var str_functions = ''
+		for ( var f in this.computePass.functions ) {
+			str_functions += this.computePass.functions[ f ] + '\r\n'
+		}
+		frag_src += str_functions + '\r\n'
+		
+		frag_src += '// MAIN\r\n'
+		frag_src += this.computePass.main + '\r\n'
+		
+		if ( debug ) console.log( frag_src )
+
+		// Update cache
+		this.shaders_src[ program_name ] = frag_src
+		this.shaders[ program_name ] = this.setupShader( frag_src, gl.FRAGMENT_SHADER )
+		this.programs[ program_name ] = this.setupProgram( this.shaders.pass_through, this.shaders[ program_name ] )
+		console.log( 'generateProgram(): ' + program_name + ' program added.')
+	}
+	return this.programs[ program_name ]
+}
+
+TCompute.prototype.renderPass = function() {
 	var gl = this.context
 	
-	//var currentViewport = gl.getParameter( gl.VIEWPORT )
-	var viewport = { x: 0, y: 0, z: width, w: height }
-	//viewportsEqual( currentViewport, viewport )
+	gl.useProgram( this.computePass.program )
 	
-	this.state.viewport( viewport )
+	this.bindBuffers( this.computePass.objects )
 	
-	gl.bindFramebuffer( gl.FRAMEBUFFER, this.framebuffer )
-	gl.framebufferTexture2D( gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0 )
-
-	if( gl.checkFramebufferStatus( gl.FRAMEBUFFER ) != gl.FRAMEBUFFER_COMPLETE )
-		console.error( 'bindFramebuffer(): Framebuffer not complete' )
+	this.bindFramebuffer( this.computePass.framebuffer )
+	
+	this.bindUniforms( this.computePass.data )
+	
+	this.bindTextures( this.computePass.textures )
+	
+	gl.drawElements( gl.TRIANGLES, this.computePass.objects.elements.length, gl.UNSIGNED_SHORT, 0 )
+	
+	this.unbindTextures( this.computePass.textures )
+	
+	// handoff context
+	this.state.resetGL()
 }
 
 /* Read data out as floats
@@ -416,96 +559,90 @@ TCompute.prototype.readFloat = function( M, N, packed ) {
 	return !packed || sub_end == 0 ? readBuffer : readBuffer.subarray( -size, -sub_end )
 }
 
-TCompute.prototype.renderPass = function( output, program, buffers, uniforms, textures ) {
-	var gl = this.context
-	
-	this.program = program
-	
-	gl.useProgram( program )
-	
-	this.bindBuffers( buffers )
-	
-	this.bindUniforms( uniforms )
-	
-	this.bindTextures( textures )
-	
-	this.bindFramebuffer( output.height, output.width, output.texture )
-	
-	gl.drawElements( gl.TRIANGLES, buffers.elements_length, gl.UNSIGNED_SHORT, 0 )
-	
-	this.unbindTextures( textures )
-	
-	// handoff context
-	this.state.resetGL()
-}
-
 /*	float texture read, allows output as packed+deferred or unpacked
  */
 TCompute.prototype.render = function( M, N, tensor, out, packed ) {
-	var output = { width: N, height: M, texture: out }
+	// Objects
+	var objects = this.buffers.framequad
 	
-	var uniforms = {}
+	// Framebuffer
+	var framebuffer = { width: N, height: M, texture: out, channel: out.channel || 0, bindChannel: false, bindShape: true }
+	
+	// Data
+	var data = {}
 
 	if ( packed ) {
 		var W = Math.ceil( N / 4 )
 		var H = M
 		
-		output.width = W
+		framebuffer.width = W
 		
-		var pad = W * 4 - N
+		var Wup = W * 4
+		var Wuphs = ( 1 / Wup ) * 0.5
 		
-		uniforms = {
-			cols: 			{ type: 'uniform1f', value: W },
-			col_hstep: 		{ type: 'uniform1f', value: ( 1 / W ) * 0.5 },
-			rows: 			{ type: 'uniform1f', value: H },
-			row_hstep: 		{ type: 'uniform1f', value: ( 1 / H ) * 0.5 },
-			
-			up_cols: 		{ type: 'uniform1f', value: W * 4 },
-			up_col_hstep: 	{ type: 'uniform1f', value: ( 1 / (W * 4) ) * 0.5 },
-			up_cols_padded: { type: 'uniform1f', value: W * 4 - pad }
+		var pad = Wup - N
+		var Wup_padded = Wup - pad
+		
+		data = {
+			up_cols: 		{ type: 'uniform1f', value: Wup, comment: '\t\t// Unpacked # columns' },
+			up_col_hstep: 	{ type: 'uniform1f', value: Wuphs },
+			up_cols_padded: { type: 'uniform1f', value: Wup_padded, comment: '// Unpacked # columns less padding\r\n' }
 		}
 	}
+
+	// Textures
+	var textures = {}
 	
-	var textures = {
-		A: tensor
+	textures.A = { type: 'sampler2D', value: tensor, bindChannel: true, bindShape: true }
+	
+	// GLSL Functions
+	var functions = {}
+	
+	if ( packed ) {
+		functions.get_indices 		= this.functions_src.get_indices
+		functions.get_coords 		= this.functions_src.get_coords
+		functions.get_channel_value = this.functions_src.get_channel_value
 	}
 	
-	// Dynamic generation occurs here
-	// we have uniforms and textures set and can now include them in shader
+	// GLSL Main
+	var flipy = tensor.isInput ? '' : '' //'#define FLIPY\r\n'
+	var main = packed ? flipy + this.main_src.render_packed : flipy + this.main_src.render_unpacked
 	
-	// -> extend ability to common functions get/set_channel_value
+	// Shader generation
+	var program_name = 'render' + ( packed ? '_packed' : '' )// + ( tensor.isInput ? '_flipy' : '' )
+	this.computePass = {
+		objects: 		objects,
+		framebuffer: 	framebuffer,
+		data: 			data,
+		textures: 		textures,
+		functions: 		functions,
+		main: 			main
+	}
 	
-	// -> use caching for generated programs, follow similar method of generate_mixin_program()
+	this.computePass.program = this.generateProgram( program_name, false )
 	
-	// -> externalize ability to write frag shader main() from outside
-	var program = packed ? this.programs.render_packed : this.programs.render_unpacked
-	
-	var buffers = this.buffers.framequad
-	
-	this.renderPass( output, program, buffers, uniforms, textures )
+	this.renderPass()
 }
 
 /*	direct texture float data read (no float encode) - requires OES_texture_float support
  */
 TCompute.prototype.read = function( M, N, tensor, out ) {
-	var output = { width: N, height: M, texture: out }
-	
-	var uniforms = {}
+	// Objects
+	var objects = this.buffers.framequad
+
+	var framebuffer = { width: N, height: M, texture: out, channel: out.channel || 0, bindChannel: false, bindShape: true }
+
+	var data = {}
 
 	if ( tensor.requires_padding ) {
 		var W = Math.ceil( N / 4 )
 		var H = M
 		
-		output.width = W
+		framebuffer.width = W
 		
 		var pad = W * 4 - N
 		
-		uniforms = {
-			cols: 			{ type: 'uniform1f', value: W },
-			col_hstep: 		{ type: 'uniform1f', value: ( 1 / W ) * 0.5 },
-			rows: 			{ type: 'uniform1f', value: H },
-			row_hstep: 		{ type: 'uniform1f', value: ( 1 / H ) * 0.5 },
-			
+		data = {			
 			up_cols: 		{ type: 'uniform1f', value: W * 4 },
 			up_col_hstep: 	{ type: 'uniform1f', value: ( 1 / (W * 4) ) * 0.5 },
 			
@@ -514,150 +651,244 @@ TCompute.prototype.read = function( M, N, tensor, out ) {
 		}
 	}
 	
-	var textures = {
-		A: tensor
+	var textures = {}	
+	textures.A = { type: 'sampler2D', value: tensor, bindChannel: false, bindShape: false }
+
+	// GLSL Functions
+	var functions = {}
+	if ( tensor.requires_padding ) {
+		functions.get_indices 		= this.functions_src.get_indices
+		functions.get_coords 		= this.functions_src.get_coords
+		functions.get_channel_value = this.functions_src.get_channel_value
 	}
 
-	var program = tensor.requires_padding ? this.programs.read_packed_padded : this.programs.read_packed
-	
-	var buffers = this.buffers.framequad
-	
-	this.renderPass( output, program, buffers, uniforms, textures )
+	// GLSL Main
+	var main = tensor.requires_padding ? this.main_src.read_packed_padded : this.main_src.read_packed
+
+	var program_name = 'read_packed' + ( tensor.requires_padding ? '_padded' : '' )
+	this.computePass = {
+		objects: 		objects,
+		framebuffer: 	framebuffer,
+		data: 			data,
+		textures: 		textures,
+		functions: 		functions,
+		main: 			main
+	}
+
+	this.computePass.program = this.generateProgram( program_name, false )
+
+	this.renderPass()
 }
 
 /*	duplicate texture (use in iterative calculations)
  */
 TCompute.prototype.duplicate = function( M, N, tensor, out, packed ) {
-	var output = { width: N, height: M, texture: out.texture }
-	
-	var uniforms = {}
+	var objects = this.buffers.framequad
 
-	if ( !packed ) {		
-		uniforms = {
-			write_channel:	{ type: 'uniform1i', value: out.channel }
-		}
-	}
+	var framebuffer = { width: N, height: M, texture: out.texture, channel: out.channel || 0, bindChannel: true, bindShape: true }
 	
-	var textures = {
-		A: tensor
+	var data = {}
+	
+	var textures = {}
+	textures.A = { type: 'sampler2D', value: tensor, bindChannel: true, bindShape: false }
+
+	// GLSL Functions
+	var functions = {}
+	if ( !packed ) {
+		functions.get_channel_value = this.functions_src.get_channel_value
+		functions.set_channel_value = this.functions_src.set_channel_value
 	}
 
-	var program = !packed ? this.programs.duplicate : this.programs.duplicate_packed
+	// GLSL Main
+	var flipy = tensor.isInput ? '' : '' // '#define FLIPY\r\n'
+	var main = packed ? flipy + this.main_src.duplicate_packed : flipy + this.main_src.duplicate
 	
-	var buffers = this.buffers.framequad
+	// Shader generation
+	var program_name = 'duplicate' + ( packed ? '_packed' : '' ) + ( tensor.isInput ? '_flipy' : '' )
+	this.computePass = {
+		objects: 		objects,
+		framebuffer: 	framebuffer,
+		data: 			data,
+		textures: 		textures,
+		functions: 		functions,
+		main: 			main
+	}
+
+	this.computePass.program = this.generateProgram( program_name, false )
 	
-	this.renderPass( output, program, buffers, uniforms, textures )
+	this.renderPass()
 }
 
 /*	used to convert a unpacked texture into a packed texture
  */
 TCompute.prototype.pack = function( M, N, tensor, out ) {
-	var output = { width: N, height: M, texture: out }
+	var objects = this.buffers.framequad
 	
-	var uniforms = {}
+	var framebuffer = { width: N, height: M, texture: out, channel: out.channel || 0, bindChannel: true, bindShape: true }
+	
+	var data = {}
 
 	var W = Math.ceil( N / 4 )
 	var H = M
 	
-	uniforms = {
-		cols: 			{ type: 'uniform1f', value: W },
-		col_hstep: 		{ type: 'uniform1f', value: ( 1 / W ) * 0.5 },
-		rows: 			{ type: 'uniform1f', value: H },
-		row_hstep: 		{ type: 'uniform1f', value: ( 1 / H ) * 0.5 },
-		
+	data = {		
 		up_cols: 		{ type: 'uniform1f', value: N },
 		up_col_hstep: 	{ type: 'uniform1f', value: ( 1 / N ) * 0.5 }
 	}
-	
-	var textures = {
-		A: tensor
+
+	var textures = {}
+
+	textures.A = { type: 'sampler2D', value: tensor, bindChannel: true, bindShape: false }
+
+	// GLSL Functions
+	var functions = {}
+	functions.get_indices 		= this.functions_src.get_indices
+	functions.get_coords 		= this.functions_src.get_coords
+	functions.get_channel_value = this.functions_src.get_channel_value
+
+	// GLSL Main
+	var main = this.main_src.pack
+
+	var program_name = 'pack'
+	this.computePass = {
+		objects: 		objects,
+		framebuffer: 	framebuffer,
+		data: 			data,
+		textures: 		textures,
+		functions: 		functions,
+		main: 			main
 	}
 
-	var program = this.programs.pack
+	this.computePass.program = this.generateProgram( program_name, false )
 	
-	var buffers = this.buffers.framequad
-	
-	this.renderPass( output, program, buffers, uniforms, textures )
+	this.renderPass()
 }
 
 /*	used to convert a packed texture (data is held in all RGBA channels)
 	into an unpacked texture (data is held in a selected channel)
  */
 TCompute.prototype.unpack = function( M, N, tensor, out ) {
-	var output = { width: N, height: M, texture: out }
-	
-	var uniforms = {}
+	var objects = this.buffers.framequad
+
+	var framebuffer = { width: N, height: M, texture: out, channel: tensor.channel, bindChannel: true, bindShape: true }
+
+	var data = {}
 
 	var W = N
 	var H = M
 	
-	uniforms = {
-		cols: 			{ type: 'uniform1f', value: W },
-		col_hstep: 		{ type: 'uniform1f', value: ( 1 / W ) * 0.5 },
-		rows: 			{ type: 'uniform1f', value: H },
-		row_hstep: 		{ type: 'uniform1f', value: ( 1 / H ) * 0.5 },
-		
-		p_cols: 		{ type: 'uniform1f', value: Math.ceil( W / 4 ) },
-		p_col_hstep: 	{ type: 'uniform1f', value: ( 1 / Math.ceil( W / 4 ) ) * 0.5 },
-		
-		write_channel:	{ type: 'uniform1i', value: tensor.channel }
-	}
-	
-	var textures = {
-		A: tensor
+	var p_cols = Math.ceil( W / 4 )
+	var p_col_hstep = ( 1 / p_cols ) * 0.5
+	//console.log( 'unpack', p_cols, p_col_hstep )
+
+	data = {
+		p_cols: 		{ type: 'uniform1f', value: p_cols },
+		p_col_hstep: 	{ type: 'uniform1f', value: p_col_hstep }
 	}
 
-	var program = this.programs.unpack
+	var textures = {}
+
+	textures.A = { type: 'sampler2D', value: tensor, bindChannel: false, bindShape: false }
+
+	// GLSL Functions
+	var functions = {}
+	functions.get_indices 		= this.functions_src.get_indices
+	functions.get_coords 		= this.functions_src.get_coords
+	functions.get_channel_value = this.functions_src.get_channel_value
+	functions.set_channel_value = this.functions_src.set_channel_value
+
+	// GLSL Main
+	var main = this.main_src.unpack
+
+	var program_name = 'unpack'
+	this.computePass = {
+		objects: 		objects,
+		framebuffer: 	framebuffer,
+		data: 			data,
+		textures: 		textures,
+		functions: 		functions,
+		main: 			main
+	}
+
+	this.computePass.program = this.generateProgram( program_name, false )
 	
-	var buffers = this.buffers.framequad
-	
-	this.renderPass( output, program, buffers, uniforms, textures )
+	this.renderPass()
 }
 
 /* tranpose a texture where input has M rows and N columns
  */
 TCompute.prototype.transpose = function( M, N, tensor, out ) {
-	// WARNING! SWITCHED M | N 
-	var output = { width: M, height: N, texture: out.texture }
+	var objects = this.buffers.framequad
 	
-	var uniforms = {}
+	// WARNING! switched M | N for transpose
+	var framebuffer = { width: M, height: N, texture: out.texture, channel: out.channel || 0, bindChannel: true, bindShape: false }
+	
+	var data = {}
 
-	uniforms = {
-		write_channel:	{ type: 'uniform1i', value: out.channel }
+	var textures = {}
+
+	textures.A = { type: 'sampler2D', value: tensor, bindChannel: true, bindShape: false }
+	
+	// GLSL Functions
+	var functions = {}
+	
+	functions.get_channel_value = this.functions_src.get_channel_value
+	functions.set_channel_value = this.functions_src.set_channel_value
+	
+	// GLSL Main
+	var main = this.main_src.transpose
+
+	this.computePass = {
+		objects: 		objects,
+		framebuffer: 	framebuffer,
+		data: 			data,
+		textures: 		textures,
+		functions: 		functions,
+		main: 			main
 	}
 	
-	var textures = {
-		A: tensor
-	}
-
-	var program = this.programs.transpose_unpacked	
+	this.computePass.program = this.generateProgram( 'transpose', false )
 	
-	var buffers = this.buffers.framequad
-	
-	this.renderPass( output, program, buffers, uniforms, textures )
+	this.renderPass()
 }
 
 /*	combine texture channels
  */
 TCompute.prototype.mixin = function( M, N, red, green, blue, alpha, mix ) {
-	var output = { width: N, height: M, texture: mix.texture }
+	var objects = this.buffers.framequad
 	
-	var uniforms = {}
+	var framebuffer = { width: N, height: M, texture: mix.texture, channel: mix.channel || 0, bindChannel: false, bindShape: false }
+	
+	var data = {}
 	var textures = {}
 
-	if ( red != null ) textures.RED = red
-	if ( green != null ) textures.GREEN = green
-	if ( blue != null )	textures.BLUE = blue
-	if ( alpha != null ) textures.ALPHA = alpha
-
-	var program = this.generate_mixin_program( red, green, blue, alpha )
+	if ( red != null ) textures.RED 	= { type: 'sampler2D', value: red, bindChannel: true, bindShape: false }
+	if ( green != null ) textures.GREEN = { type: 'sampler2D', value: green, bindChannel: true, bindShape: false }
+	if ( blue != null )	textures.BLUE 	= { type: 'sampler2D', value: blue, bindChannel: true, bindShape: false }
+	if ( alpha != null ) textures.ALPHA = { type: 'sampler2D', value: alpha, bindChannel: true, bindShape: false }
 	
-	var buffers = this.buffers.framequad
+	// GLSL Functions
+	var functions = {}	
+	functions.get_channel_value = this.functions_src.get_channel_value
 	
-	this.renderPass( output, program, buffers, uniforms, textures )
+	// GLSL Main
+	var main = this.generate_mixin_main( red, green, blue, alpha )
+	
+	this.computePass = {
+		objects: 		objects,
+		framebuffer: 	framebuffer,
+		data: 			data,
+		textures: 		textures,
+		functions: 		functions,
+		main: 			main.source
+	}
+	
+	this.computePass.program = this.generateProgram( main.name, false )
+	
+	this.renderPass()
 }
 
-TCompute.prototype.generate_mixin_program = function( red, green, blue, alpha ) {
+TCompute.prototype.generate_mixin_main = function( red, green, blue, alpha ) {
 	var gl = this.context
 	
 	var r = red != null ? 'r' : 'n'
@@ -667,52 +898,45 @@ TCompute.prototype.generate_mixin_program = function( red, green, blue, alpha ) 
 	
 	// compose name along the pattern "mixin_rgba_program"
 	// where each channel is replaced with "n" if null
-	var program_name = 'mixin_' + r + g + b + a + '_program'
+	var program_name = 'mixin_' + r + g + b + a// + '_program'
 	
-	// generate only if program is inexistent
-	if ( !this.programs.hasOwnProperty( program_name ) ) {
+	var frag_src = ''
+	
+	// generate only if source is inexistent
+	if ( !this.main_src.hasOwnProperty( program_name ) ) {
 
-		var new_frag = this.shaders_src.mixin // dynamic shader base struture
-
-		// glsify appends a numeric code to each 'glsified' shader function
-		// we must source the fragment with this renamed function
-		var get_channel_value_fnc = new RegExp( '(get_channel_value_)(\\d+)' ).exec( new_frag )
+		frag_src = 'void main( void ) {\r\n'
 
 		var uniforms = { 'RED': red, 'GREEN': green, 'BLUE': blue, 'ALPHA': alpha }
 		var values = { 'RED': '0.0', 'GREEN': '0.0', 'BLUE': '0.0', 'ALPHA': '0.0' }
 
 		for ( var key in uniforms ) {
 			if ( uniforms[ key ] != null ) {
-				var new_frag_uniform = 	'uniform sampler2D	' + key + '; 				// texture with unpacked data ' + key + '\r\n' +
-										'uniform int			' + key + '_channel; 		// channel to read data from\r\n'
-
-				var new_frag_value = 	'float ' + key + ' = ' + get_channel_value_fnc[0] + '( ' + key + ', ' + key + '_channel, UVs );\r\n'
-
-				new_frag = new_frag.replace( '// u' + key + '\r\n', new_frag_uniform )
-				new_frag = new_frag.replace( '// m' + key + '\r\n', new_frag_value )
+				frag_src += '\tfloat ' + key + ' = get_channel_value( ' + key + ', ' + key + 'chan, UVs );\r\n'
 
 				values[ key ] = key
 			}
 		}
 
-		var new_glfragcolor = 'gl_FragColor = vec4( ' + values[ 'RED' ] + ', ' +
-														values[ 'GREEN' ] + ', ' +
-														values[ 'BLUE' ] + ', ' +
-														values[ 'ALPHA' ] + ' );\r\n'
+		var glfragcolor = '\tgl_FragColor = vec4( ' + values[ 'RED' ] + ', ' +
+													values[ 'GREEN' ] + ', ' +
+													values[ 'BLUE' ] + ', ' +
+													values[ 'ALPHA' ] + ' );\r\n'
 
-		new_frag = new_frag.replace( '// glFG\r\n', new_glfragcolor )
+		frag_src += glfragcolor		
+		frag_src += '}\r\n'
+		
+		this.main_src[ program_name ] = frag_src
 
-		this.shaders[ program_name ] = this.setupShader( new_frag, gl.FRAGMENT_SHADER )
-		this.programs[ program_name ] = this.setupProgram( this.shaders.pass_through, this.shaders[ program_name ] )
 	}
-	return this.programs[ program_name ]
+	return { name: program_name, source: frag_src }
 }
 
 /*	Basic wraper for some gl methods if THREE not present
 	allows sharing of webgl context
  */
 function TComputeState( gl ) {
-	this.gl = gl // remove
+	this.gl = gl
 }
 
 TComputeState.prototype.initAttributes = function() {}
@@ -732,7 +956,6 @@ TComputeState.prototype.bindTexture = function( textureType, texture ) {
 }
 
 TComputeState.prototype.texImage2D = function() {
-	//target, level, internalformat, width, height, border, format, type, pixels
 	this.gl.texImage2D.apply( this.gl, arguments )
 }
 

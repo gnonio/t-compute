@@ -8,7 +8,6 @@ float get_channel_value( sampler2D texture, int channel, vec2 xy ) {
 		value = texture2D( texture, xy ).b;
 	} else if ( channel == 3 ) {
 		value = texture2D( texture, xy ).a;
-	}	
+	}
 	return value;
 }
-#pragma glslify: export(get_channel_value)
