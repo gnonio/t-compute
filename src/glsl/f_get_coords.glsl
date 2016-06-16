@@ -1,7 +1,13 @@
-vec2 get_coords( float index, float cols, float cols_hstep, float rows, float row_hstep ) {
-	float iindex = index + cols_hstep; // + cols_hstep prevents padded bug
-	float col_index = mod( iindex, cols );
-	float row_index = floor( iindex / cols );
+vec2 get_coords( float index, float cols, float cols_halfp, float rows, float row_halfp ) {
+	float col_index = modulo( index, cols ); // custom mod function addressing float division rounding error
+	float row_index = floor( ( index + 0.5 ) / cols ); // as above
+	
+	return vec2( col_index * cols_halfp * 2.0 + cols_halfp, row_index * row_halfp * 2.0 + row_halfp );
+}
 
-	return vec2( col_index / cols + cols_hstep, row_index / rows + row_hstep );
+vec2 getUV( float index, vec2 shape, vec2 halfp ) {
+	float x = modulo( index, shape.x ); // custom mod function addressing float division rounding error
+	float y = floor( ( index + 0.5 ) / shape.x ); // as above
+	
+	return vec2( x * halfp.x * 2.0 + halfp.x, y * halfp.y * 2.0 + halfp.y );
 }
