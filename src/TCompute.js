@@ -66,6 +66,10 @@ function TCompute( renderer ) {
 		this.float_support = true
 	}
 	
+	// Settings
+	this.glSettings = {}
+	this.glSettings.flipy = false
+	
 	// Compute Pass
 	this.computePass = {}
 	
@@ -101,6 +105,7 @@ TCompute.prototype.setupPrograms = function() {
 	
 	// Shader common function sources
 	this.functions_src = {
+		modulo:				fs.readFileSync('./src/glsl/f_modulo.glsl', 'utf8'),
 		get_indices:		fs.readFileSync('./src/glsl/f_get_indices.glsl', 'utf8'),
 		get_coords:			fs.readFileSync('./src/glsl/f_get_coords.glsl', 'utf8'),
 		get_channel_value:	fs.readFileSync('./src/glsl/f_get_channel_value.glsl', 'utf8'),
@@ -111,8 +116,10 @@ TCompute.prototype.setupPrograms = function() {
 	
 	// Shader main function sources
 	this.main_src = {
-		render_unpacked:	fs.readFileSync('./src/glsl/m_render_unpacked.glsl', 'utf8'),
-		render_packed:		fs.readFileSync('./src/glsl/m_render_packed.glsl', 'utf8'),
+		/*render_unpacked:	fs.readFileSync('./src/glsl/m_render_unpacked.glsl', 'utf8'),
+		render_packed:		fs.readFileSync('./src/glsl/m_render_packed.glsl', 'utf8'),*/
+		download:			fs.readFileSync('./src/glsl/m_download.glsl', 'utf8'),
+		download_packed:	fs.readFileSync('./src/glsl/m_download_packed.glsl', 'utf8'),
 		read_packed:		fs.readFileSync('./src/glsl/m_read_packed.glsl', 'utf8'),
 		read_packed_padded:	fs.readFileSync('./src/glsl/m_read_packed_padded.glsl', 'utf8'),
 		duplicate:			fs.readFileSync('./src/glsl/m_duplicate.glsl', 'utf8'),
@@ -278,7 +285,7 @@ TCompute.prototype.setupTexture = function( M, N, data, packed, glFormat, glType
 	
 	this.state.bindTexture( gl.TEXTURE_2D, texture )
 	
-	gl.pixelStorei( gl.UNPACK_FLIP_Y_WEBGL, false )
+	gl.pixelStorei( gl.UNPACK_FLIP_Y_WEBGL, this.glSettings.flipy )
 	gl.pixelStorei( gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false )
 	//gl.pixelStorei( gl.UNPACK_ALIGNMENT, 4 )
 
@@ -429,12 +436,13 @@ TCompute.prototype.gatherUniforms = function() {
 	
 	var data = this.computePass.data
 	var type = {
-		'uniform1f': 'float\t',
-		'uniform1i': 'int\t\t',
-		'sampler2D': 'sampler2D'
+		'uniform1f': 	'float\t',
+		'uniform1i': 	'int\t\t',
+		'uniform2fv': 	'vec2\t',
+		'sampler2D': 	'sampler2D'
 	}
 	for ( var d in data ) {
-		uniforms[ d ] = { type: type[ data[ d ].type ], comment: data[ d ].comment || '' }
+		uniforms[ d ] = { type: type[ data[ d ].type ], comment: '\t\t// ' + data[ d ].comment || '' }
 	}
 
 
@@ -473,7 +481,12 @@ TCompute.prototype.generateProgram = function( program_name, debug ) {
 		
 		frag_src += '// SETTINGS\r\n'
 		frag_src += 'precision highp float;\r\n'
-		frag_src += '\r\n'
+		frag_src += 'const float OUTchannels = 4.0;\r\n'
+		var str_settings = ''		
+		for ( var s in this.computePass.settings ) {
+			if ( this.computePass.settings[ s ] ) str_settings += '#define ' + s.toUpperCase() + '\r\n'
+		}
+		frag_src += str_settings + '\r\n'
 		
 		frag_src += '// VARYINGS\r\n'
 		frag_src += 'varying vec2\t\tUVs;\r\n'
@@ -515,6 +528,8 @@ TCompute.prototype.generateProgram = function( program_name, debug ) {
 
 TCompute.prototype.renderPass = function() {
 	var gl = this.context
+	
+	// TODO: bind caching
 	
 	gl.useProgram( this.computePass.program )
 	
@@ -561,66 +576,86 @@ TCompute.prototype.readFloat = function( M, N, packed ) {
 
 /*	float texture read, allows output as packed+deferred or unpacked
  */
-TCompute.prototype.render = function( M, N, tensor, out, packed ) {
-	// Objects
-	var objects = this.buffers.framequad
-	
-	// Framebuffer
-	var framebuffer = { width: N, height: M, texture: out, channel: out.channel || 0, bindChannel: false, bindShape: true }
-	
-	// Data
-	var data = {}
+TCompute.prototype.download = function( M, N, tensor, out, packed ) {
+	var objects,
+		framebuffer,
+		data = {},
+		textures = {},
+		settings = {},
+		functions = {},
+		main,
+		program_name
 
-	if ( packed ) {
-		var W = Math.ceil( N / 4 )
-		var H = M
-		
-		framebuffer.width = W
-		
-		var Wup = W * 4
-		var Wuphs = ( 1 / Wup ) * 0.5
-		
-		var pad = Wup - N
-		var Wup_padded = Wup - pad
-		
-		data = {
-			up_cols: 		{ type: 'uniform1f', value: Wup, comment: '\t\t// Unpacked # columns' },
-			up_col_hstep: 	{ type: 'uniform1f', value: Wuphs },
-			up_cols_padded: { type: 'uniform1f', value: Wup_padded, comment: '// Unpacked # columns less padding\r\n' }
-		}
-	}
+	// Objects
+	objects = this.buffers.framequad
+
+	// Framebuffer
+	framebuffer = { width: N, height: M, texture: out, channel: out.channel || 0, bindChannel: false, bindShape: true }
+
+	// Data
 
 	// Textures
-	var textures = {}
-	
 	textures.A = { type: 'sampler2D', value: tensor, bindChannel: true, bindShape: true }
-	
+
+	// GLSL Settings
+	settings.flipy = this.glSettings.flipy
+
 	// GLSL Functions
-	var functions = {}
-	
+	// TODO: automate function include
+
+	// GLSL Main
+	main = this.main_src.download
+
+	// GLSL Name
+	program_name = 'download'
+
 	if ( packed ) {
+		// GLSL Option Name
+		program_name += '_packed'
+
+		// Data
+		var W = Math.ceil( N / 4 )
+		var H = M
+
+		framebuffer.width = W
+
+		var up_shape = new Float32Array( [ N, M ] )
+		var up_halfp = new Float32Array( [ ( 1 / N ) * 0.5, ( 1 / M ) * 0.5 ] )		
+		
+		data = {
+			UPshape:	{ type: 'uniform2fv', value: up_shape, comment: 'Unpacked # columns' },
+			UPhalfp:	{ type: 'uniform2fv', value: up_halfp, comment: 'Unpacked half pixel' }
+		}
+
+		// Textures
+
+		// GLSL Settings
+		settings.packed = packed
+
+		// GLSL Functions
+		// TODO: automate function include (find available functions in supplied source)
+		functions.modulo 			= this.functions_src.modulo
 		functions.get_indices 		= this.functions_src.get_indices
 		functions.get_coords 		= this.functions_src.get_coords
 		functions.get_channel_value = this.functions_src.get_channel_value
+
+		// GLSL Main
+		main = this.main_src.download_packed
 	}
-	
-	// GLSL Main
-	var flipy = tensor.isInput ? '' : '' //'#define FLIPY\r\n'
-	var main = packed ? flipy + this.main_src.render_packed : flipy + this.main_src.render_unpacked
-	
+
 	// Shader generation
-	var program_name = 'render' + ( packed ? '_packed' : '' )// + ( tensor.isInput ? '_flipy' : '' )
 	this.computePass = {
 		objects: 		objects,
 		framebuffer: 	framebuffer,
 		data: 			data,
 		textures: 		textures,
+		settings: 		settings,
 		functions: 		functions,
 		main: 			main
 	}
-	
-	this.computePass.program = this.generateProgram( program_name, false )
-	
+
+	this.computePass.program = this.generateProgram( program_name, true )
+
 	this.renderPass()
 }
 

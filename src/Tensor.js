@@ -211,7 +211,7 @@ Tensor.prototype.unpack = function( slot ) {
 	optionally allows to output as unpacked texture
 	defaults to packed type as that is what we usually need on the CPU side
  */
-Tensor.prototype.download = function( keep, unpacked, pretify ) {
+Tensor.prototype.download = function( keep, unpacked, pretifyTensor ) {
 	var gl = this.gl
 	
 	if ( this.packed ) {
@@ -232,7 +232,7 @@ Tensor.prototype.download = function( keep, unpacked, pretify ) {
 	// create output texture	
 	out = gl.setupTexture( M, N, null, packed, gl.context.RGBA, gl.context.FLOAT )
 	// invoke shader
-	gl.render( M, N, this, out, packed )
+	gl.download( M, N, this, out, packed )
 	result = gl.readFloat( M, N, packed )
 	
 	// clean up
@@ -242,9 +242,9 @@ Tensor.prototype.download = function( keep, unpacked, pretify ) {
 		this.delete()
 	}
 	
-	var prety = pretify === undefined ? false : true
+	var prety = pretifyTensor === undefined ? false : true
 	if ( prety ) {
-		result_str = pretifyTensor( { shape: this.shape, data: result, packed: packed } )
+		result_str = pretify( { shape: this.shape, data: result, packed: packed } )
 		result = { data: result, string: result_str }
 	}
 	
@@ -301,7 +301,7 @@ Tensor.prototype.mixin = function ( red, green, blue, alpha ) {
 	//gl.context.deleteTexture( old_texture )
 }
 
-function pretifyTensor( tensor ) {
+function pretify( tensor ) {
 	var shape = tensor.shape
 	var array = tensor.data
 	var packed = tensor.packed
@@ -311,22 +311,30 @@ function pretifyTensor( tensor ) {
 	var stride = 1
 	var result_str = ''
 	
-	var max = 0
-	var anyFraction = false
-	for ( var i = 0; i < M * N; i++ ) {
-		var value = array[ i ]
-		max = value > max ? value : max
-		if ( value % 1 !== 0 ) anyFraction = true
+	var col_max = new Float32Array( N )
+	var col_anyFr = new Float32Array( N )
+	var col_maxFD = new Float32Array( N )
+	var col_maxID = new Float32Array( N )
+	var col_maxD = new Float32Array( N )
+	for ( var j = 0; j < N; j++ ) {
+		for ( var i = 0; i < M; i++ ) {
+			var value = array[ i * N * stride + j * stride ]
+			col_max[ j ] = value > col_max[ j ] ? value : col_max[ j ]
+			if ( value % 1 !== 0 ) col_anyFr[ j ] = true
+		}
+		
+		col_maxFD[ j ] = col_anyFr[ j ] ? 3 : 0
+		col_maxID[ j ] = 1
+		
+		for ( var p = 1; p < 6; p++ ) {
+			var floor = Math.pow( 10, p )
+			var ceil = Math.pow( 10, p + 1 )
+			if ( col_max[ j ] >= floor && col_max[ j ] < ceil ) col_maxID[ j ] = p + 1
+		}
+		
+		col_maxD[ j ] = col_maxID[ j ] + 0 + col_maxFD[ j ]
 	}
-	var maxFD = anyFraction ? 3 : 0
-	var maxID = 1
-	for ( var i = 1; i < 6; i++ ) {
-		var floor = Math.pow( 10, i )
-		var ceil = Math.pow( 10, i + 1 )
-		if ( max >= floor && value < ceil ) maxID = i + 1
-	}
-
-	var maxD = maxID + 0 + maxFD
+	
 	for ( var i = 0; i < M; i++ ) {
 		var rj = ''
 		for ( var j = 0; j < N; j++ ) {
@@ -334,11 +342,11 @@ function pretifyTensor( tensor ) {
 			var first = j === 0
 			var last = j + 1 === N
 			
-			var pixel = fourths && !first && !last ? ' | ' : ''
-			var comma = ( !fourths || first ) && !last ? ', ' : ''
+			var pixel = fourths && !first && !last && !packed ? ' | ' : ''
+			var comma = ( ( !fourths || packed ) || first ) && !last ? ', ' : ''
 			
 			var value = array[ i * N * stride + j * stride ]
-			var value_str = fillString( value, maxD, maxFD )
+			var value_str = fillString( value, col_maxD[ j ], col_maxFD[ j ] )
 			
 			rj += value_str + comma + pixel
 		}
@@ -349,6 +357,7 @@ function pretifyTensor( tensor ) {
 	var info = 'Shape: ' + M + 'x' + N + ' | ' + packed_str + '\r\n'
 	return info + result_str
 }
+module.exports.pretify = pretify
 
 function fillString( value, digits, fraction ) {
 	var maxID = 1
