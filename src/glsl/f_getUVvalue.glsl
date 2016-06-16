@@ -1,4 +1,4 @@
-float get_channel_value( sampler2D texture, int channel, vec2 xy ) {
+float getUVvalue( sampler2D texture, int channel, vec2 xy ) {
 	float value = 0.0;
 	if ( channel == 0 ) {
 		value = texture2D( texture, xy ).r;

@@ -106,6 +106,9 @@ TCompute.prototype.setupPrograms = function() {
 	// Shader common function sources
 	this.functions_src = {
 		modulo:				fs.readFileSync('./src/glsl/f_modulo.glsl', 'utf8'),
+		getUV:				fs.readFileSync('./src/glsl/f_getUV.glsl', 'utf8'),
+		getUVvalue:			fs.readFileSync('./src/glsl/f_getUVvalue.glsl', 'utf8'),
+		getXY:				fs.readFileSync('./src/glsl/f_getXY.glsl', 'utf8'),
 		get_indices:		fs.readFileSync('./src/glsl/f_get_indices.glsl', 'utf8'),
 		get_coords:			fs.readFileSync('./src/glsl/f_get_coords.glsl', 'utf8'),
 		get_channel_value:	fs.readFileSync('./src/glsl/f_get_channel_value.glsl', 'utf8'),
@@ -116,8 +119,6 @@ TCompute.prototype.setupPrograms = function() {
 	
 	// Shader main function sources
 	this.main_src = {
-		/*render_unpacked:	fs.readFileSync('./src/glsl/m_render_unpacked.glsl', 'utf8'),
-		render_packed:		fs.readFileSync('./src/glsl/m_render_packed.glsl', 'utf8'),*/
 		download:			fs.readFileSync('./src/glsl/m_download.glsl', 'utf8'),
 		download_packed:	fs.readFileSync('./src/glsl/m_download_packed.glsl', 'utf8'),
 		read_packed:		fs.readFileSync('./src/glsl/m_read_packed.glsl', 'utf8'),
@@ -419,6 +420,29 @@ TCompute.prototype.unbindTextures = function( textures ) {
 	}
 }
 
+// SHADER GENERATION
+TCompute.prototype.gatherVaryings = function() {
+	// compose string
+	var varyings_str = ''
+
+	varyings_str += 'varying vec2\t\tUVs;\r\n'
+	
+	return varyings_str + '\r\n'
+}
+TCompute.prototype.gatherSettings = function() {
+	// compose string
+	var settings_str = ''
+	
+	settings_str += 'precision highp float;\r\n'
+	settings_str += 'const float OUTchannels = 4.0;\r\n'
+	
+	for ( var s in this.computePass.settings ) {
+		if ( this.computePass.settings[ s ] ) settings_str += '#define ' + s.toUpperCase() + '\r\n'
+	}
+	
+	return settings_str + '\r\n'
+}
+
 TCompute.prototype.gatherUniforms = function() {
 	var uniforms = {}
 	
@@ -461,7 +485,54 @@ TCompute.prototype.gatherUniforms = function() {
 		}
 	}
 
-	return uniforms
+	// compose string
+	var str_uniforms = ''
+	for ( var u in uniforms ) {
+		var uniform = uniforms[ u ]
+		var type = uniform.type
+		var comment = uniform.comment || ''
+		str_uniforms += 'uniform ' + type + '\t ' + u + ';\t' + comment + '\r\n'
+	}
+	
+	return str_uniforms + '\r\n'
+}
+
+TCompute.prototype.gatherFunctions = function() {
+	var found_functions = {}
+	var ffnames = ''
+	
+	// check for functions in main source, mantain order
+	for ( var name in _shaderSources.functions ) {
+		var source = _shaderSources.functions[ name ]
+		var functionPosition = this.computePass.main.indexOf( String( name ) )		
+		if ( functionPosition > -1 ) {
+			found_functions[ functionPosition + 10000 ] = { name: name, source: source }
+			ffnames += name + ' '
+			
+		}
+	}
+	// check for functions within found functions, mantain order, prevent duplicates
+	var fc = 0
+	for ( var name in _shaderSources.functions ) {
+		var source = _shaderSources.functions[ name ]
+		for ( var ff in found_functions ) {
+			var ffname = found_functions[ ff ].name
+			var ffsource = found_functions[ ff ].source			
+			var notfoundyet = !ffnames.includes( String( name ) )
+			if ( ffsource.includes( String( name ) ) && notfoundyet ) {
+				found_functions[ fc ] = { name: name, source: source }
+				ffnames += name + ' '
+			}			
+		}
+		fc++
+	}
+	
+	// compose string
+	var functions_str = ''
+	for ( var f in found_functions ) {
+		functions_str += found_functions[ f ].source
+	}
+	return functions_str + '\r\n'
 }
 
 TCompute.prototype.generateProgram = function( program_name, debug ) {
@@ -480,38 +551,31 @@ TCompute.prototype.generateProgram = function( program_name, debug ) {
 		frag_src += '\r\n'
 		
 		frag_src += '// SETTINGS\r\n'
-		frag_src += 'precision highp float;\r\n'
+		frag_src += this.gatherSettings()
+
+		/*frag_src += 'precision highp float;\r\n'
 		frag_src += 'const float OUTchannels = 4.0;\r\n'
 		var str_settings = ''		
 		for ( var s in this.computePass.settings ) {
 			if ( this.computePass.settings[ s ] ) str_settings += '#define ' + s.toUpperCase() + '\r\n'
 		}
-		frag_src += str_settings + '\r\n'
+		frag_src += str_settings + '\r\n'*/
 		
 		frag_src += '// VARYINGS\r\n'
-		frag_src += 'varying vec2\t\tUVs;\r\n'
-		frag_src += '\r\n'
-		//var varyings = this.gatherVaryings()
+		frag_src += this.gatherVaryings()
 		
 		frag_src += '// UNIFORMS\r\n'
-		var uniforms = this.gatherUniforms()
-		
-		var str_uniforms = ''
-		for ( var u in uniforms ) {
-			var uniform = uniforms[ u ]
-			var type = uniform.type
-			var comment = uniform.comment || ''
-			str_uniforms += 'uniform ' + type + '\t ' + u + ';\t' + comment + '\r\n'
-		}
-		frag_src += str_uniforms + '\r\n'		
+		frag_src += this.gatherUniforms()
 		
 		frag_src += '// FUNCTIONS\r\n'
-		var str_functions = ''
+		frag_src += this.gatherFunctions()
+		
+		/*var str_functions = ''
 		for ( var f in this.computePass.functions ) {
 			str_functions += this.computePass.functions[ f ] + '\r\n'
 		}
-		frag_src += str_functions + '\r\n'
-		
+		frag_src += str_functions + '\r\n'*/
+
 		frag_src += '// MAIN\r\n'
 		frag_src += this.computePass.main + '\r\n'
 		
@@ -576,13 +640,12 @@ TCompute.prototype.readFloat = function( M, N, packed ) {
 
 /*	float texture read, allows output as packed+deferred or unpacked
  */
-TCompute.prototype.download = function( M, N, tensor, out, packed ) {
+TCompute.prototype.download = function( M, N, tensor, out, asPacked ) {
 	var objects,
 		framebuffer,
 		data = {},
 		textures = {},
 		settings = {},
-		functions = {},
 		main,
 		program_name
 
@@ -590,6 +653,8 @@ TCompute.prototype.download = function( M, N, tensor, out, packed ) {
 	objects = this.buffers.framequad
 
 	// Framebuffer
+	// TODO: pass a 'out' tensor object instead of texture,
+	// to facilitade framebuffer / settings configuration
 	framebuffer = { width: N, height: M, texture: out, channel: out.channel || 0, bindChannel: false, bindShape: true }
 
 	// Data
@@ -598,10 +663,9 @@ TCompute.prototype.download = function( M, N, tensor, out, packed ) {
 	textures.A = { type: 'sampler2D', value: tensor, bindChannel: true, bindShape: true }
 
 	// GLSL Settings
+	// TODO: tie settings to passed textures? may disallow some shader caching
+	// some settings should be prefilled in any case
 	settings.flipy = this.glSettings.flipy
-
-	// GLSL Functions
-	// TODO: automate function include
 
 	// GLSL Main
 	main = this.main_src.download
@@ -609,35 +673,24 @@ TCompute.prototype.download = function( M, N, tensor, out, packed ) {
 	// GLSL Name
 	program_name = 'download'
 
-	if ( packed ) {
+	if ( asPacked ) {
 		// GLSL Option Name
-		program_name += '_packed'
+		program_name += '_asPacked'
 
-		// Data
-		var W = Math.ceil( N / 4 )
-		var H = M
-
-		framebuffer.width = W
+		framebuffer.width = Math.ceil( N / 4 )
 
 		var up_shape = new Float32Array( [ N, M ] )
 		var up_halfp = new Float32Array( [ ( 1 / N ) * 0.5, ( 1 / M ) * 0.5 ] )		
 		
 		data = {
-			UPshape:	{ type: 'uniform2fv', value: up_shape, comment: 'Unpacked # columns' },
+			UPshape:	{ type: 'uniform2fv', value: up_shape, comment: 'Unpacked shape' },
 			UPhalfp:	{ type: 'uniform2fv', value: up_halfp, comment: 'Unpacked half pixel' }
 		}
 
 		// Textures
 
 		// GLSL Settings
-		settings.packed = packed
-
-		// GLSL Functions
-		// TODO: automate function include (find available functions in supplied source)
-		functions.modulo 			= this.functions_src.modulo
-		functions.get_indices 		= this.functions_src.get_indices
-		functions.get_coords 		= this.functions_src.get_coords
-		functions.get_channel_value = this.functions_src.get_channel_value
+		settings.packed = asPacked
 
 		// GLSL Main
 		main = this.main_src.download_packed
@@ -650,7 +703,6 @@ TCompute.prototype.download = function( M, N, tensor, out, packed ) {
 		data: 			data,
 		textures: 		textures,
 		settings: 		settings,
-		functions: 		functions,
 		main: 			main
 	}
 
@@ -727,29 +779,21 @@ TCompute.prototype.duplicate = function( M, N, tensor, out, packed ) {
 	var textures = {}
 	textures.A = { type: 'sampler2D', value: tensor, bindChannel: true, bindShape: false }
 
-	// GLSL Functions
-	var functions = {}
-	if ( !packed ) {
-		functions.get_channel_value = this.functions_src.get_channel_value
-		functions.set_channel_value = this.functions_src.set_channel_value
-	}
-
 	// GLSL Main
-	var flipy = tensor.isInput ? '' : '' // '#define FLIPY\r\n'
-	var main = packed ? flipy + this.main_src.duplicate_packed : flipy + this.main_src.duplicate
+	//var flipy = tensor.isInput ? '' : '' // '#define FLIPY\r\n'
+	var main = packed ? this.main_src.duplicate_packed : this.main_src.duplicate
 	
 	// Shader generation
-	var program_name = 'duplicate' + ( packed ? '_packed' : '' ) + ( tensor.isInput ? '_flipy' : '' )
+	var program_name = 'duplicate' + ( packed ? '_packed' : '' )
 	this.computePass = {
 		objects: 		objects,
 		framebuffer: 	framebuffer,
 		data: 			data,
 		textures: 		textures,
-		functions: 		functions,
 		main: 			main
 	}
 
-	this.computePass.program = this.generateProgram( program_name, false )
+	this.computePass.program = this.generateProgram( program_name, true )
 	
 	this.renderPass()
 }
