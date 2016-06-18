@@ -8,9 +8,12 @@
 
 var fs = require('fs')
 
+var _withTHREE = false
+
 try {
 	if ( Number( THREE.REVISION ) >= 76 ) {
 		THREE.Compute = TCompute
+		_withTHREE = true
 	}
 } catch ( error ) {}
 
@@ -51,6 +54,7 @@ function TCompute( renderer ) {
 	this.renderer = renderer
 	this.context = gl
 	this.state = state
+	this.withTHREE = _withTHREE
 
 	// Capabilities
 	var float_support
@@ -260,13 +264,13 @@ TCompute.prototype.setupFramebuffer = function() {
 	this.state.viewport( targetViewport )
 	
 	this.framebuffer = gl.createFramebuffer()
+	this.fbTexture = this.setupTexture( [ 2, 2 ], null, gl.RGBA, gl.FLOAT )
 	
-	var texture = this.setupTexture( 2, 2, null, false, gl.RGBA, gl.FLOAT )
-	this.state.bindTexture( gl.TEXTURE_2D, texture )
+	this.state.bindTexture( gl.TEXTURE_2D, this.fbTexture )
 	
 	this.state.texImage2D( gl.TEXTURE_2D, 0, gl.RGBA, 2, 2, 0, gl.RGBA, gl.FLOAT, null )
 	gl.bindFramebuffer( gl.FRAMEBUFFER, this.framebuffer )
-	gl.framebufferTexture2D( gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0 )
+	gl.framebufferTexture2D( gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.fbTexture, 0 )
 
 	if( gl.checkFramebufferStatus( gl.FRAMEBUFFER ) != gl.FRAMEBUFFER_COMPLETE )
 		console.error( 'bindFramebuffer(): Framebuffer not complete' )
@@ -276,13 +280,19 @@ TCompute.prototype.setupFramebuffer = function() {
 
 /* Create a texture for both input and output
  */
-TCompute.prototype.setupTexture = function( M, N, data, packed, glFormat, glType ) {
+TCompute.prototype.setupTexture = function( shape, data, glFormat, glType ) {
 	var gl = this.context
 	
-	var W = packed ? Math.ceil( N / 4 ) : N
-	var H = M
+	/*var W = packed ? Math.ceil( N / 4 ) : N
+	var H = M*/
+	
+	var width = shape[ 1 ]
+	var height = shape[ 0 ]
 
 	var texture = gl.createTexture()
+	
+	/*texture.width = W
+	texture.height = H*/
 	
 	this.state.bindTexture( gl.TEXTURE_2D, texture )
 	
@@ -290,7 +300,7 @@ TCompute.prototype.setupTexture = function( M, N, data, packed, glFormat, glType
 	gl.pixelStorei( gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false )
 	//gl.pixelStorei( gl.UNPACK_ALIGNMENT, 4 )
 
-	this.state.texImage2D( gl.TEXTURE_2D, 0, glFormat, W, H, 0, glFormat, glType, data )
+	this.state.texImage2D( gl.TEXTURE_2D, 0, glFormat, width, height, 0, glFormat, glType, data )
 	
 	gl.texParameteri( gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE )
 	gl.texParameteri( gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE )
@@ -546,20 +556,11 @@ TCompute.prototype.generateProgram = function( program_name, debug ) {
 		//var attributes = this.gatherAttributes()
 
 		// FRAGMENT
-		//var frag_src = this.shaders_src.dynamic_fragment
-		var frag_src = '// Shader: ' + program_name + ' ( generated )\r\n'
+		var frag_src = '// Shader: ' + program_name + '\r\n'
 		frag_src += '\r\n'
 		
 		frag_src += '// SETTINGS\r\n'
 		frag_src += this.gatherSettings()
-
-		/*frag_src += 'precision highp float;\r\n'
-		frag_src += 'const float OUTchannels = 4.0;\r\n'
-		var str_settings = ''		
-		for ( var s in this.computePass.settings ) {
-			if ( this.computePass.settings[ s ] ) str_settings += '#define ' + s.toUpperCase() + '\r\n'
-		}
-		frag_src += str_settings + '\r\n'*/
 		
 		frag_src += '// VARYINGS\r\n'
 		frag_src += this.gatherVaryings()
@@ -569,12 +570,6 @@ TCompute.prototype.generateProgram = function( program_name, debug ) {
 		
 		frag_src += '// FUNCTIONS\r\n'
 		frag_src += this.gatherFunctions()
-		
-		/*var str_functions = ''
-		for ( var f in this.computePass.functions ) {
-			str_functions += this.computePass.functions[ f ] + '\r\n'
-		}
-		frag_src += str_functions + '\r\n'*/
 
 		frag_src += '// MAIN\r\n'
 		frag_src += this.computePass.main + '\r\n'
@@ -593,7 +588,7 @@ TCompute.prototype.generateProgram = function( program_name, debug ) {
 TCompute.prototype.renderPass = function() {
 	var gl = this.context
 	
-	// TODO: bind caching
+	// TODO: binds caching, if sharing context how to inspect externally bound buffers?
 	
 	gl.useProgram( this.computePass.program )
 	
@@ -618,11 +613,11 @@ TCompute.prototype.renderPass = function() {
 	to the end of the array instead of having padded 0s per each row to prevent any user postprocessing
 	this is done at the shader level but must be handled when generating the CPU array
 */
-TCompute.prototype.readFloat = function( M, N, packed ) {
+TCompute.prototype.readFramebuffer = function( shape ) {
 	var gl = this.context
 
-	var W = packed ? Math.ceil( N / 4 ) : N
-	var H = M
+	var W = shape[ 1 ]
+	var H = shape[ 0 ]
 	var size = H * W * Float32Array.BYTES_PER_ELEMENT * 4
 
 	// create destination buffer
@@ -631,16 +626,12 @@ TCompute.prototype.readFloat = function( M, N, packed ) {
 	var readBuffer = new Float32Array( rawbuffer )
 	gl.readPixels( 0, 0, W, H, gl.RGBA, gl.FLOAT, readBuffer )
 
-	var sub_end = ( size - M * N * Float32Array.BYTES_PER_ELEMENT ) / 4
-	
-	// !!?? subarray() must use negative indexes of the relevant part else the full typed array is returned
-	// Must use negative indexes
-	return !packed || sub_end == 0 ? readBuffer : readBuffer.subarray( -size, -sub_end )
+	return readBuffer.subarray( 0, size )
 }
 
 /*	float texture read, allows output as packed+deferred or unpacked
  */
-TCompute.prototype.download = function( M, N, tensor, out, asPacked ) {
+TCompute.prototype.download = function( output, asPacked, tensor ) {
 	var objects,
 		framebuffer,
 		data = {},
@@ -655,7 +646,13 @@ TCompute.prototype.download = function( M, N, tensor, out, asPacked ) {
 	// Framebuffer
 	// TODO: pass a 'out' tensor object instead of texture,
 	// to facilitade framebuffer / settings configuration
-	framebuffer = { width: N, height: M, texture: out, channel: out.channel || 0, bindChannel: false, bindShape: true }
+	var M = tensor.shape[ 0 ]
+	var N = tensor.shape[ 1 ]
+	/*var shape = [ M, N ]
+	
+	var out = gl.setupTexture( shape, null, gl.context.RGBA, gl.context.FLOAT )*/
+	
+	framebuffer = { width: N, height: M, texture: output, channel: tensor.channel || 0, bindChannel: false, bindShape: true }
 
 	// Data
 
@@ -678,13 +675,13 @@ TCompute.prototype.download = function( M, N, tensor, out, asPacked ) {
 		program_name += '_asPacked'
 
 		framebuffer.width = Math.ceil( N / 4 )
-
-		var up_shape = new Float32Array( [ N, M ] )
-		var up_halfp = new Float32Array( [ ( 1 / N ) * 0.5, ( 1 / M ) * 0.5 ] )		
+		
+		var glsl_shape = get_glsl_shape( tensor.shape )
+		var normalised_shape_halved = normalise_half( glsl_shape )
 		
 		data = {
-			UPshape:	{ type: 'uniform2fv', value: up_shape, comment: 'Unpacked shape' },
-			UPhalfp:	{ type: 'uniform2fv', value: up_halfp, comment: 'Unpacked half pixel' }
+			UPshape: { type: 'uniform2fv', value: new Float32Array( glsl_shape ), comment: 'Unpacked shape' },
+			UPhalfp: { type: 'uniform2fv', value: new Float32Array( normalised_shape_halved ), comment: 'Unpacked half pixel' }
 		}
 
 		// Textures
@@ -706,7 +703,7 @@ TCompute.prototype.download = function( M, N, tensor, out, asPacked ) {
 		main: 			main
 	}
 
-	this.computePass.program = this.generateProgram( program_name, true )
+	this.computePass.program = this.generateProgram( program_name, false )
 
 	this.renderPass()
 }
@@ -793,7 +790,7 @@ TCompute.prototype.duplicate = function( M, N, tensor, out, packed ) {
 		main: 			main
 	}
 
-	this.computePass.program = this.generateProgram( program_name, true )
+	this.computePass.program = this.generateProgram( program_name, false )
 	
 	this.renderPass()
 }
@@ -1045,6 +1042,21 @@ TComputeState.prototype.viewport = function( viewport ) {
 TComputeState.prototype.resetGL = function() {}
 
 // Utils
+// User informs shape of matrix following M x N ( rows x columns ) notation as in math
+// inside glsl the convention adopted to refer to rows and columns is .y and .x respectively
+// as in x = abscissa and y = ordinate
+// this 
+function get_glsl_shape( shape ) {
+	return [ shape[ 1 ], shape[ 0 ] ]
+}
+// normalised shape, for use within shaders
+function normalise( glsl_shape ) {
+	return [ 1 / glsl_shape[ 0 ], 1 / glsl_shape[ 1 ] ]
+}
+// normalised shape pre-halved, to shorten in-glsl computations
+function normalise_half( glsl_shape ) {
+	return [ 0.5 / glsl_shape[ 0 ], 0.5 / glsl_shape[ 1 ] ]
+}
 // check viewports
 function viewportsEqual( cv, tv ) {
 	if ( cv[0] === tv.x && cv[1] === tv.y && cv[2] === tv.z && cv[3] === tv.w ) {

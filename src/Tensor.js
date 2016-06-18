@@ -30,10 +30,11 @@ function Tensor( shape, data/*, format, type*/ ) {
 		N = shape[1]
 
 	this.shape = shape
+	this.shape_asPacked = [ shape[0], Math.ceil( shape[1] / 4 ) ]
 
 	this.gl = gl
 	
-	this.requires_padding = N % 4 != 0
+	this.requires_padding = N % 4 !== 0
 	this.requires_encode = !this.gl.float_support
 
 	this.packed = false
@@ -46,26 +47,24 @@ function Tensor( shape, data/*, format, type*/ ) {
 		var glType = gl.context.FLOAT
 		/*if ( format !== undefined ) glFormat = gl.context[ format ]
 		if ( type !== undefined ) glType = gl.context[ type ]*/
-		this.texture = gl.setupTexture( M, N, null, false, glFormat, glType )
+		this.texture = gl.setupTexture( this.shape, null, glFormat, glType )
 		this.channel = 0
 	} else {
 		this.isInput = true
 		if ( !( data instanceof Float32Array ) ) data = Float32Array.from( data )
-		this.texture = gl.setupTexture( M, N, data, false, gl.context.LUMINANCE, gl.context.FLOAT )
+		this.texture = gl.setupTexture( this.shape, data, gl.context.LUMINANCE, gl.context.FLOAT )
 		this.channel = 0 // 0 = RED, 1 = GREEN, 2 = BLUE, 3 = ALPHA
 	}
 	// Create THREE texture
-	try {
-		if ( Number( THREE.REVISION ) >= 76 ) {
-			var texture = new THREE.GpuTexture( this.texture, this.shape[1], this.shape[0], THREE.RGBAFormat, THREE.FloatType )
-			this.THREE = texture
-		}
-	} catch ( error ) {}
+	if ( this.gl.withTHREE ) {
+		var texture = new THREE.GpuTexture( this.texture, this.shape[1], this.shape[0], THREE.RGBAFormat, THREE.FloatType )
+		this.THREE = texture
+	}
 
 }
 
-Tensor.setGL = function( gl_mngr ) {
-	gl = gl_mngr
+Tensor.setGL = function( gl_wrapper ) {
+	gl = gl_wrapper
 }
 
 Tensor.prototype.delete = function() {
@@ -111,9 +110,9 @@ Tensor.prototype.transfer = function( keep ) {
 		weblas.gpu.gl.context.deleteTexture(out)*/
 	} else {
 		// direct read floats, functions deal with adjusting ouput texture format/shape
-		out = gl.setupTexture( M, N, null, true, gl.context.RGBA, gl.context.FLOAT )
+		out = gl.setupTexture( this.shape_asPacked, null, gl.context.RGBA, gl.context.FLOAT )
 		gl.read( M, N, this, out )
-		result = gl.readFloat( M, N, true )
+		result = gl.readFramebuffer( this.shape_asPacked )
 		
 		// clean up
 		gl.context.deleteTexture(out)
@@ -141,6 +140,7 @@ Tensor.prototype.transpose = function( keep ) {
 	} else {
 		//tT = new weblas.unpacked.Tensor( [N, M], null )
 		tT = new Tensor( [N, M], null )
+		// TODO: set same channel as original? probably
 		gl.transpose( M, N, this, tT )
 	}
 
@@ -166,7 +166,7 @@ Tensor.prototype.pack = function() {
 		out
 	
 	// create output texture	
-	out = gl.setupTexture( M, N, null, true, gl.context.RGBA, gl.context.FLOAT )
+	out = gl.setupTexture( this.shape_asPacked, null, gl.context.RGBA, gl.context.FLOAT )
 	// invoke shader
 	gl.pack( M, N, this, out )
 	// clean up
@@ -196,7 +196,7 @@ Tensor.prototype.unpack = function( slot ) {
 	this.channel = typeof slot == 'undefined' ? 0 : slot
 
 	// create output texture
-	out = gl.setupTexture( M, N, null, false, gl.context.RGBA, gl.context.FLOAT )
+	out = gl.setupTexture( this.shape, null, gl.context.RGBA, gl.context.FLOAT )
 	// invoke shader
 	gl.unpack( M, N, this, out )
 	// clean up
@@ -211,42 +211,46 @@ Tensor.prototype.unpack = function( slot ) {
 	optionally allows to output as unpacked texture
 	defaults to packed type as that is what we usually need on the CPU side
  */
-Tensor.prototype.download = function( keep, unpacked, pretifyTensor ) {
-	var gl = this.gl
+Tensor.prototype.download = function() {
+	var options = arguments[ 0 ] instanceof Object ? arguments[ 0 ] : {}
+	options.asPacked = options.asPacked === undefined ? true : options.asPacked
+	options.pretify = options.pretify === undefined ? false : options.pretify
+	options.dispose = options.dispose === undefined ? false : options.dispose
 	
 	if ( this.packed ) {
 		console.info('download(): Packed texture - using transfer()')
-		return this.transfer( keep )
+		return this.transfer( !options.dispose )
 	}
-	/*if ( !gl.context.isTexture( this.texture ) )
-		throw new Error('download(): Texture is void.')*/
+	
+	var gl = this.gl
 
-	var M = this.shape[0],
-		N = this.shape[1],
-		out,
-		result,
-		result_str
+	var M = this.shape[0]
+	var	N = this.shape[1]
 	
-	var packed = unpacked === undefined ? true : !unpacked
+	// the actual required shape can be arbitrary, since the shader computes a flat sequence of elements
+	// the number of pixels (ie. M * N) is the actual minimum
+	// if we constrain N to a 4 multiple could we also simplify shader?
+	// readFramebuffer ignores buffer overruned elements
+	// lets keep the obvious logic here for now
+	var outputShape = options.asPacked ? this.shape_asPacked : this.shape
 	
-	// create output texture	
-	out = gl.setupTexture( M, N, null, packed, gl.context.RGBA, gl.context.FLOAT )
-	// invoke shader
-	gl.download( M, N, this, out, packed )
-	result = gl.readFloat( M, N, packed )
+	// prepare result texture
+	var output = gl.setupTexture( outputShape, null, gl.context.RGBA, gl.context.FLOAT )
+	
+	// invoke computation
+	gl.download( output, options.asPacked, this )
+	
+	// dump results to CPU, usually result stays in GPU and this step is skipped
+	var result = gl.readFramebuffer( outputShape )
 	
 	// clean up
-	gl.context.deleteTexture( out )
-	
-	if ( !keep ){
-		this.delete()
+	gl.context.deleteTexture( output )
+
+	if ( options.pretify && !this.packed ) { // never pretify packed tensors for now
+		result = pretify( { tensor: this, data: result, asPacked: options.asPacked } )
 	}
 	
-	var prety = pretifyTensor === undefined ? false : true
-	if ( prety ) {
-		result_str = pretify( { shape: this.shape, data: result, packed: packed } )
-		result = { data: result, string: result_str }
-	}
+	if ( options.dispose ) this.delete()
 	
 	return result
 }
@@ -301,13 +305,16 @@ Tensor.prototype.mixin = function ( red, green, blue, alpha ) {
 	//gl.context.deleteTexture( old_texture )
 }
 
-function pretify( tensor ) {
-	var shape = tensor.shape
-	var array = tensor.data
-	var packed = tensor.packed
+function pretify( options ) {
+	var shape = options.tensor === undefined ? options.shape : options.tensor.shape
+	var packed = options.tensor === undefined ? options.packed : options.tensor.packed
+	var channel = options.tensor === undefined ? options.channel : options.tensor.channel
+	
+	var data = options.data
+	var asPacked = options.asPacked
 	
 	var M = shape[ 0 ]
-	var N = packed ? shape[ 1 ] : shape[ 1 ] * 4
+	var N = asPacked ? shape[ 1 ] : shape[ 1 ] * 4
 	var stride = 1
 	var result_str = ''
 	
@@ -318,7 +325,7 @@ function pretify( tensor ) {
 	var col_maxD = new Float32Array( N )
 	for ( var j = 0; j < N; j++ ) {
 		for ( var i = 0; i < M; i++ ) {
-			var value = array[ i * N * stride + j * stride ]
+			var value = data[ i * N * stride + j * stride ]
 			col_max[ j ] = value > col_max[ j ] ? value : col_max[ j ]
 			if ( value % 1 !== 0 ) col_anyFr[ j ] = true
 		}
@@ -342,10 +349,10 @@ function pretify( tensor ) {
 			var first = j === 0
 			var last = j + 1 === N
 			
-			var pixel = fourths && !first && !last && !packed ? ' | ' : ''
-			var comma = ( ( !fourths || packed ) || first ) && !last ? ', ' : ''
+			var pixel = fourths && !first && !last && !asPacked ? ' | ' : ''
+			var comma = ( ( !fourths || asPacked ) || first ) && !last ? ', ' : ''
 			
-			var value = array[ i * N * stride + j * stride ]
+			var value = data[ i * N * stride + j * stride ]
 			var value_str = fillString( value, col_maxD[ j ], col_maxFD[ j ] )
 			
 			rj += value_str + comma + pixel
@@ -354,7 +361,8 @@ function pretify( tensor ) {
 		result_str += rj + endl
 	}
 	var packed_str = packed ? 'Packed' : 'Unpacked'
-	var info = 'Shape: ' + M + 'x' + N + ' | ' + packed_str + '\r\n'
+	var asPacked_str = asPacked ? 'asPacked' : 'asUnpacked'
+	var info = '\r\nShape: ' + M + 'x' + N + ' | ' + packed_str + ' | ' + asPacked_str + ' | Channel: ' + channel + '\r\n'
 	return info + result_str
 }
 module.exports.pretify = pretify
@@ -416,6 +424,8 @@ function mixin( red, green, blue, alpha ) {
 
 	//var mix = new weblas.unpacked.Tensor( tensors[0].shape, null )
 	var mix = new Tensor( tensors[0].shape, null )
+	// TODO: set channel as '4', to help distinguish from other tensor types?
+	// ie. '0' = default or 'n' = effective channel
 
 	var gl = tensors[0].gl // must fetch gl from first tensor, we're out of scope
 
